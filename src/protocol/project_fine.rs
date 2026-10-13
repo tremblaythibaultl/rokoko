@@ -2,7 +2,7 @@ use std::any::Any;
 
 use crate::{
     common::{
-        arithmetic::{precompute_structured_values_fast, HALF_WAY_MOD_Q_RING_CF},
+        arithmetic::{precompute_structured_values_fast, HALF_WAY_MOD_Q_RING_CF, LAZY_REDUCTION},
         config::{DEGREE, MOD_Q, NOF_BATCHES},
         hash::HashWrapper,
         matrix::{HorizontallyAlignedMatrix, VerticallyAlignedMatrix},
@@ -32,6 +32,9 @@ pub fn compute_j_batched(
     // ring elements.  Each ring element j_batched[i] accumulates:
     //   j_batched[i][d] = Σ_k  c_1[k] · J_embedded[k, i·DEGREE + d]
     // where J_embedded is the dual-embedded projection matrix.
+    if !LAZY_REDUCTION {
+        return compute_j_batched_exact(projection_matrix, c_1_values);
+    }
     let inner_width_ring =
         projection_matrix.projection_ratio * (projection_matrix.projection_height / DEGREE);
     let mut j_batched = vec![RingElement::zero(Representation::IncompleteNTT); inner_width_ring];
@@ -146,10 +149,34 @@ pub fn compute_j_batched(
     j_batched
 }
 
+/// [`compute_j_batched`] for moduli past `LAZY_REDUCTION`: the column sums exactly, then the same
+/// conversion to incomplete-NTT form and conjugation.
+fn compute_j_batched_exact(
+    projection_matrix: &ProjectionMatrix,
+    c_1_values: &[u64],
+) -> Vec<RingElement> {
+    let inner_width_ring =
+        projection_matrix.projection_ratio * (projection_matrix.projection_height / DEGREE);
+    let sums = projection_matrix.signed_column_sums_mod(c_1_values, MOD_Q);
+    sums.chunks_exact(DEGREE)
+        .take(inner_width_ring)
+        .map(|sums| {
+            let mut el = RingElement::zero(Representation::Coefficients);
+            el.v.copy_from_slice(sums);
+            el.to_representation(Representation::IncompleteNTT);
+            el.conjugate_in_place();
+            el
+        })
+        .collect()
+}
+
 pub fn compute_j_batched_collectively(
     projection_matrix: &ProjectionMatrix,
     c_1_values: &[Vec<u64>; NOF_BATCHES],
 ) -> [Vec<RingElement>; NOF_BATCHES] {
+    if !LAZY_REDUCTION {
+        return std::array::from_fn(|b| compute_j_batched_exact(projection_matrix, &c_1_values[b]));
+    }
     let inner_width_ring =
         projection_matrix.projection_ratio * (projection_matrix.projection_height / DEGREE);
     let mut j_batched: [Vec<RingElement>; NOF_BATCHES] = std::array::from_fn(|_| {
@@ -408,6 +435,15 @@ pub fn project_coefficients(
     witness: &VerticallyAlignedMatrix<RingElement>,
     projection_matrix: &ProjectionMatrix,
 ) -> VerticallyAlignedMatrix<RingElement> {
+    project_coefficients_with::<{ !LAZY_REDUCTION }>(witness, projection_matrix)
+}
+
+/// [`project_coefficients`], with `EXACT` summing each row in `i128` instead of the biased
+/// accumulators (any `q < 2^64`).
+fn project_coefficients_with<const EXACT: bool>(
+    witness: &VerticallyAlignedMatrix<RingElement>,
+    projection_matrix: &ProjectionMatrix,
+) -> VerticallyAlignedMatrix<RingElement> {
     let mut witness_coeff = VerticallyAlignedMatrix {
         data: vec![
             RingElement::zero(Representation::IncompleteNTT);
@@ -495,6 +531,16 @@ pub fn project_coefficients(
                     [current_projection_coeff_index];
                 // Compute the inner product: projection_subimage[inner_row] = J[inner_row, :] · subwitness
                 // J has (projection_ratio * PROJECTION_HEIGHT) columns
+
+                if EXACT {
+                    // Replaces the bias: the sum is exact and already reduced.
+                    *target = projection_matrix.signed_row_sum_mod(
+                        inner_row,
+                        |i| subwitness[i / DEGREE].v[i % DEGREE],
+                        MOD_Q,
+                    );
+                    continue;
+                }
 
                 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
                 {
@@ -1069,6 +1115,49 @@ mod tests {
                 "batch_projection column {} should produce the same result as computing project_coefficients followed by batching",
                 col
             );
+        }
+    }
+
+    /// The exact paths taken past `LAZY_REDUCTION` reproduce the biased kernels at `MOD_Q`.
+    #[test]
+    fn exact_projection_paths_match_the_lazy_kernels() {
+        crate::common::init_common();
+        let mut hash_wrapper = HashWrapper::new();
+        for (ratio, height, witness_height) in [(2, 256, 8), (4, 128, 8), (1, 256, 4)] {
+            let mut projection_matrix = ProjectionMatrix::new(ratio, height);
+            projection_matrix.sample(&mut hash_wrapper);
+            let mut data =
+                vec![RingElement::random(Representation::IncompleteNTT); 2 * witness_height];
+            data[0] = RingElement::all(MOD_Q - 1, Representation::Coefficients);
+            data[0].to_representation(Representation::IncompleteNTT);
+            let witness = VerticallyAlignedMatrix {
+                data,
+                width: 2,
+                height: witness_height,
+                used_cols: 2,
+            };
+            assert_eq!(
+                project_coefficients_with::<true>(&witness, &projection_matrix).data,
+                project_coefficients_with::<false>(&witness, &projection_matrix).data,
+                "ratio {ratio}, height {height}"
+            );
+        }
+        for (ratio, height) in [(2, 256), (32, 256), (8, 144)] {
+            let mut projection_matrix = ProjectionMatrix::new(ratio, height);
+            projection_matrix.sample(&mut hash_wrapper);
+            for top in [false, true] {
+                let c_1_values: Vec<u64> = (0..height)
+                    .map(|_| match top {
+                        false => hash_wrapper.sample_u64_mod_q(),
+                        true => MOD_Q - 1,
+                    })
+                    .collect();
+                assert_eq!(
+                    compute_j_batched_exact(&projection_matrix, &c_1_values),
+                    compute_j_batched(&projection_matrix, &c_1_values),
+                    "ratio {ratio}, height {height}, top {top}"
+                );
+            }
         }
     }
 

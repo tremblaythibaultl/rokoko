@@ -12,7 +12,9 @@ use crate::{
 
 #[cfg(test)]
 use crate::{
-    common::{config::MOD_Q, ring_arithmetic::Representation, structured_row::PreprocessedRow},
+    common::{
+        arithmetic::signed_mod_q, ring_arithmetic::Representation, structured_row::PreprocessedRow,
+    },
     protocol::{
         open::evaluation_point_to_structured_row,
         sumcheck_utils::{common::SumcheckBaseData, linear::LinearSumcheck},
@@ -294,11 +296,12 @@ mod tests {
         // 25 + ... + 32 = 228
 
         let claim = RingElement::constant(
-            (MOD_Q as i64
-                + 36 * (1 - 32) * (1 - 33)
-                + 100 * (1 - 32) * 33
-                + 164 * 32 * (1 - 33)
-                + 228 * 32 * 33) as u64,
+            signed_mod_q(
+                36 * (1 - 32) * (1 - 33)
+                    + 100 * (1 - 32) * 33
+                    + 164 * 32 * (1 - 33)
+                    + 228 * 32 * 33,
+            ),
             Representation::IncompleteNTT,
         );
 

@@ -16,7 +16,7 @@ use crate::{
 };
 
 #[cfg(test)]
-use crate::common::{config::MOD_Q, structured_row::PreprocessedRow};
+use crate::common::{arithmetic::signed_mod_q, structured_row::PreprocessedRow};
 
 struct Borrowed<E: 'static> {
     data: &'static [E],
@@ -924,15 +924,16 @@ mod tests {
         debug_assert_eq!(
             sumcheck.data[0],
             RingElement::constant(
-                (MOD_Q as i64
-                    + 1 * (1 - 524) * (1 - 1337) * (1 - 42)
-                    + 2 * 524 * (1 - 1337) * (1 - 42)
-                    + 3 * (1 - 524) * 1337 * (1 - 42)
-                    + 4 * 524 * 1337 * (1 - 42)
-                    + 5 * (1 - 524) * (1 - 1337) * 42
-                    + 6 * 524 * (1 - 1337) * 42
-                    + 7 * (1 - 524) * 1337 * 42
-                    + 8 * 524 * 1337 * 42) as u64,
+                signed_mod_q(
+                    1 * (1 - 524) * (1 - 1337) * (1 - 42)
+                        + 2 * 524 * (1 - 1337) * (1 - 42)
+                        + 3 * (1 - 524) * 1337 * (1 - 42)
+                        + 4 * 524 * 1337 * (1 - 42)
+                        + 5 * (1 - 524) * (1 - 1337) * 42
+                        + 6 * 524 * (1 - 1337) * 42
+                        + 7 * (1 - 524) * 1337 * 42
+                        + 8 * 524 * 1337 * 42
+                ),
                 Representation::IncompleteNTT
             )
         )
@@ -1101,15 +1102,16 @@ mod tests {
         debug_assert_eq!(
             sumcheck.final_evaluations(),
             &RingElement::constant(
-                (MOD_Q as i64
-                    + 1 * (1 - 524) * (1 - 1337) * (1 - 42)
-                    + 2 * 524 * (1 - 1337) * (1 - 42)
-                    + 3 * (1 - 524) * 1337 * (1 - 42)
-                    + 4 * 524 * 1337 * (1 - 42)
-                    + 5 * (1 - 524) * (1 - 1337) * 42
-                    + 6 * 524 * (1 - 1337) * 42
-                    + 7 * (1 - 524) * 1337 * 42
-                    + 8 * 524 * 1337 * 42) as u64,
+                signed_mod_q(
+                    1 * (1 - 524) * (1 - 1337) * (1 - 42)
+                        + 2 * 524 * (1 - 1337) * (1 - 42)
+                        + 3 * (1 - 524) * 1337 * (1 - 42)
+                        + 4 * 524 * 1337 * (1 - 42)
+                        + 5 * (1 - 524) * (1 - 1337) * 42
+                        + 6 * 524 * (1 - 1337) * 42
+                        + 7 * (1 - 524) * 1337 * 42
+                        + 8 * 524 * 1337 * 42
+                ),
                 Representation::IncompleteNTT
             )
         );

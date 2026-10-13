@@ -11,8 +11,15 @@ use crate::{
     hexl::bindings::{multiply_mod, sub_mod},
 };
 
+/// Whether `q < 2^50`, the range the lazy kernels were sized for and the one `build.rs` admits
+/// today. They bias `u64` accumulators by [`HALF_WAY_MOD_Q`], a multiple of `q` near `2^62`, add
+/// and subtract up to `2^12` unreduced residues (or `i64` sums of up to `2^13`) and reduce once. A
+/// wider `q` takes their exact paths instead, which sum in `i128` and reduce once.
+pub const LAZY_REDUCTION: bool = MOD_Q < 1 << 50;
+
+/// `floor(2^64 / 4q) q`; zero, and unused, once `4q` leaves the `u64` (see [`LAZY_REDUCTION`]).
 pub static HALF_WAY_MOD_Q: LazyLock<u64> = LazyLock::new(|| {
-    let budget = u64::MAX / (MOD_Q * 4);
+    let budget = u64::MAX / MOD_Q / 4;
     budget * MOD_Q
 });
 
@@ -27,6 +34,35 @@ use std::arch::x86_64::{
     _mm512_max_epu16, _mm512_movepi64_mask, _mm512_set1_epi64, _mm512_setzero_si512,
     _mm512_store_si512, _mm512_storeu_si512, _mm512_sub_epi16, _mm_store_si128,
 };
+
+/// `x mod q` in `[0, q)` for any `q < 2^64`; `x.rem_euclid(q as i64)` reads a `q` past `2^63` as
+/// negative.
+#[inline(always)]
+pub const fn reduce_signed(x: i64, q: u64) -> u64 {
+    let r = x.unsigned_abs() % q;
+    if x < 0 && r != 0 {
+        q - r
+    } else {
+        r
+    }
+}
+
+/// [`reduce_signed`] of an `i128`.
+#[inline(always)]
+pub const fn reduce_signed_wide(x: i128, q: u64) -> u64 {
+    let r = (x.unsigned_abs() % q as u128) as u64;
+    if x < 0 && r != 0 {
+        q - r
+    } else {
+        r
+    }
+}
+
+/// [`reduce_signed`] modulo `MOD_Q`.
+#[inline(always)]
+pub const fn signed_mod_q(x: i64) -> u64 {
+    reduce_signed(x, MOD_Q)
+}
 
 #[inline(always)]
 pub fn centered_i64_from_u64_mod_q_scalar(x: u64) -> i64 {
@@ -98,15 +134,8 @@ pub fn project_one_row_i16_to_u64<const DEGREE: usize>(
         }
     }
 
-    let q = MOD_Q as i64;
-
     for k in 0..DEGREE {
-        let x = acc[k] as i64;
-        let mut r = x % q;
-        if r < 0 {
-            r += q;
-        }
-        out_u64[k] = r as u64;
+        out_u64[k] = signed_mod_q(acc[k] as i64);
     }
 }
 
@@ -326,7 +355,7 @@ fn project_rows_scalar(
             }
         }
         for (dst, &a) in out.v.iter_mut().zip(acc.iter()) {
-            *dst = a.rem_euclid(MOD_Q as i64) as u64;
+            *dst = signed_mod_q(a);
         }
     }
 }

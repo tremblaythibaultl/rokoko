@@ -716,7 +716,8 @@ pub fn verifier_round_simple(
         );
 
         for k in 0..config.witness_width {
-            let mut expected_ct = 0;
+            // A sum of `c_1_values.len()` residues, exact in `u128` for any `q < 2^64`.
+            let mut expected_ct = 0u128;
             for j in 0..c_1_values.len() / DEGREE {
                 unsafe {
                     eltwise_mult_mod(
@@ -729,10 +730,10 @@ pub fn verifier_round_simple(
                 }
                 for l in 0..DEGREE {
                     // TODO: vectorize
-                    expected_ct += temp.v[l];
+                    expected_ct += temp.v[l] as u128;
                 }
             }
-            expected_ct %= MOD_Q;
+            let expected_ct = (expected_ct % MOD_Q as u128) as u64;
 
             let ct =
                 round_proof.batched_projection_image[(i, k)].constant_term_from_incomplete_ntt();

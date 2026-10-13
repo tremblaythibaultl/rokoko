@@ -99,6 +99,10 @@ impl Ntt {
     }
 
     pub fn with_root(degree: u64, modulus: u64, root_of_unity: u64) -> Self {
+        assert!(
+            !crate::number_theory::is_wide(modulus),
+            "modulus {modulus} is at least 2^62: the lazy [0, 4q) butterflies would overflow"
+        );
         debug_assert!(Self::check_arguments(degree, modulus));
         debug_assert!(crate::number_theory::is_primitive_root(
             root_of_unity,

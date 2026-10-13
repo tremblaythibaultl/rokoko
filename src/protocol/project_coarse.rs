@@ -361,7 +361,7 @@ mod tests {
 
         let all = |x: i64| {
             let mut element = RingElement::all(
-                x.rem_euclid(MOD_Q as i64) as u64,
+                crate::common::arithmetic::signed_mod_q(x),
                 Representation::Coefficients,
             );
             element.to_representation(Representation::IncompleteNTT);

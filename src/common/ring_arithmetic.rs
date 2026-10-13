@@ -380,9 +380,11 @@ impl RingElement {
 
         // Reverse and negate coefficients 1 to n-1
         for i in 1..(DEGREE / 2 + 1) {
+            // `(q - c) mod q`, not `q - c`: a residue equal to `q` would reach the NTT, and the
+            // wide-modulus kernels give no lazy-reduction slack.
             let temp = self.v[i];
-            self.v[i] = MOD_Q - self.v[DEGREE - i];
-            self.v[DEGREE - i] = MOD_Q - temp;
+            self.v[i] = (MOD_Q - self.v[DEGREE - i]) % MOD_Q;
+            self.v[DEGREE - i] = (MOD_Q - temp) % MOD_Q;
         }
 
         self.from_coefficients_to_strided_coefficients();
@@ -632,13 +634,14 @@ impl RingElement {
                 MOD_Q,
             );
         }
-        let mut sum = 0u64;
+        // `NUM_SLOTS` residues: their sum leaves the `u64` once `q` is wide.
+        let mut sum = 0u128;
         for i in 0..NUM_SLOTS {
-            sum += buf[i];
+            sum += buf[i] as u128;
         }
 
         // we call it once so it's probably fine
-        sum % MOD_Q
+        (sum % MOD_Q as u128) as u64
     }
 }
 
@@ -1085,9 +1088,9 @@ pub fn naive_polynomial_multiplication(
             if i + j >= DEGREE {
                 // Negation in modular arithmetic: MOD_Q - value
                 let neg_prod = (MOD_Q as u128 - prod) % (MOD_Q as u128);
-                result.v[index] = (result.v[index] + neg_prod as u64) % MOD_Q;
+                result.v[index] = ((result.v[index] as u128 + neg_prod) % MOD_Q as u128) as u64;
             } else {
-                result.v[index] = (result.v[index] + prod as u64) % MOD_Q;
+                result.v[index] = ((result.v[index] as u128 + prod) % MOD_Q as u128) as u64;
             }
         }
     }
@@ -1282,7 +1285,7 @@ impl FieldExtension {
 }
 
 /// `x mod q` for `x < 2^(bits(q) + 61)`: Barrett with `floor(2^(64 + s) / q)`, `s = bits(q) - 2`,
-/// leaves the quotient at most one short.
+/// leaves the quotient at most one short. Only [`degree4_mul`]'s lazy path, `q < 2^50`, calls it.
 #[inline(always)]
 fn reduce_wide(x: u128) -> u64 {
     const S: u32 = 62 - MOD_Q.leading_zeros();
@@ -1299,9 +1302,13 @@ fn reduce_wide(x: u128) -> u64 {
 /// Product modulo `Y^4 - alpha` by two-level Karatsuba over the integers: `l`, `h`, `s` are the
 /// products of the low halves, high halves and half sums of `a = (a0 + a1 Y) + Y^2 (a2 + a3 Y)`,
 /// so every difference is a nonnegative sum of `a_i b_j` below `16 q^2`, reduced once per
-/// coefficient.
+/// coefficient. Both bounds need `q` well below `2^62`; a wider `q` reduces every product instead
+/// ([`slot_mul_mod`]).
 #[inline(always)]
 fn degree4_mul(a: &[u64; SLOT_DEGREE], b: &[u64; SLOT_DEGREE]) -> [u64; SLOT_DEGREE] {
+    if !crate::common::arithmetic::LAZY_REDUCTION {
+        return slot_mul_mod(a, b, *FIELD_SHIFT_FACTOR, MOD_Q);
+    }
     let product = |x: u64, y: u64| x as u128 * y as u128;
     let alpha = *FIELD_SHIFT_FACTOR as u128;
     let [a0, a1, a2, a3]: [u64; 4] = std::array::from_fn(|i| a[i]);
@@ -1318,6 +1325,23 @@ fn degree4_mul(a: &[u64; SLOT_DEGREE], b: &[u64; SLOT_DEGREE]) -> [u64; SLOT_DEG
     let low = [l0, l1, l2 + s0 - l0 - h0, sm - s0 - s2 - l1 - h1];
     let high = [h0 + s2 - l2 - h2, h1, h2, 0];
     std::array::from_fn(|k| reduce_wide(low[k] + reduce_wide(high[k]) as u128 * alpha))
+}
+
+/// Schoolbook product modulo `Y^D - alpha` and `q`, reduced at every step: any `q < 2^64`.
+fn slot_mul_mod<const D: usize>(a: &[u64; D], b: &[u64; D], alpha: u64, q: u64) -> [u64; D] {
+    let (q, alpha) = (q as u128, alpha as u128);
+    let mut c = [0u128; D];
+    for i in 0..D {
+        for j in 0..D {
+            let term = a[i] as u128 * b[j] as u128 % q;
+            let (k, term) = match i + j < D {
+                true => (i + j, term),
+                false => (i + j - D, term * alpha % q),
+            };
+            c[k] = (c[k] + term) % q;
+        }
+    }
+    c.map(|c| c as u64)
 }
 
 impl Add for FieldExtension {
@@ -1668,6 +1692,56 @@ mod tests {
         }
         let top = extremes[0];
         assert_eq!(top * top, field_extension_schoolbook(&top, &top));
+    }
+
+    /// [`slot_mul_mod`], the wide-modulus path of `degree4_mul`: it matches the product at `MOD_Q`
+    /// and, at the Goldilocks prime, is a commutative, associative and distributive product with
+    /// `Y^D = alpha`.
+    #[test]
+    fn slot_mul_mod_is_the_slot_product_at_any_modulus() {
+        init_common();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+        for _ in 0..200 {
+            let a = FieldExtension {
+                coeffs: std::array::from_fn(|_| rng.random_range(0..MOD_Q)),
+            };
+            let b = FieldExtension {
+                coeffs: std::array::from_fn(|_| rng.random_range(0..MOD_Q)),
+            };
+            assert_eq!(
+                slot_mul_mod(&a.coeffs, &b.coeffs, *FIELD_SHIFT_FACTOR, MOD_Q),
+                (a * b).coeffs
+            );
+        }
+
+        const P: u64 = incomplete_rexl::GOLDILOCKS_P;
+        fn check<const D: usize>(rng: &mut rand::rngs::StdRng) {
+            let alpha = rng.random_range(2..P);
+            let monomial = |k: usize| std::array::from_fn::<u64, D, _>(|i| (i == k) as u64);
+            assert_eq!(
+                slot_mul_mod(&monomial(1), &monomial(D - 1), alpha, P),
+                std::array::from_fn(|i| if i == 0 { alpha } else { 0 })
+            );
+            let mul = |a: &[u64; D], b: &[u64; D]| slot_mul_mod(a, b, alpha, P);
+            let add = |a: [u64; D], b: [u64; D]| {
+                std::array::from_fn(|i| ((a[i] as u128 + b[i] as u128) % P as u128) as u64)
+            };
+            for _ in 0..200 {
+                let mut random = || -> [u64; D] {
+                    std::array::from_fn(|_| match rng.random_range(0..3) {
+                        0 => P - 1 - rng.random_range(0..16),
+                        _ => rng.random_range(0..P),
+                    })
+                };
+                let (a, b, c) = (random(), random(), random());
+                assert_eq!(mul(&a, &b), mul(&b, &a));
+                assert_eq!(mul(&mul(&a, &b), &c), mul(&a, &mul(&b, &c)));
+                assert_eq!(mul(&a, &add(b, c)), add(mul(&a, &b), mul(&a, &c)));
+            }
+        }
+        check::<2>(&mut rng);
+        check::<3>(&mut rng);
+        check::<4>(&mut rng);
     }
 
     #[test]

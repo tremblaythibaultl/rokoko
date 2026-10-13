@@ -544,7 +544,7 @@ fn interpolate(degree: usize, sums: &[RingElement], out: &mut Polynomial<RingEle
             v -= &eight;
             v -= &u;
             v -= &u;
-            v *= &RingElement::constant((MOD_Q + 1) / 2, Representation::IncompleteNTT);
+            v *= &RingElement::constant(MOD_Q / 2 + 1, Representation::IncompleteNTT);
             c[2].set_from(&v);
             c[1] -= (&u, &v);
         }

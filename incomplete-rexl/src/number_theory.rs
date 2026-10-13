@@ -1,6 +1,7 @@
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::sync::{LazyLock, Mutex};
 
+use crate::goldilocks;
 use crate::util::{
     divide_u128_u64_lo, is_power_of_two, log2, maximum_value, multiply_u64_full, multiply_u64_hi,
 };
@@ -40,7 +41,34 @@ impl MultiplyFactor {
     }
 }
 
+/// Moduli from `2^62` on leave no room for HEXL's lazy `[0, 2q)` and `[0, 4q)` ranges, its
+/// Barrett shifts or its sign-bit tricks; they take exact paths (Goldilocks its own, the rest
+/// `u128` remainders) instead.
+#[inline(always)]
+pub const fn is_wide(modulus: u64) -> bool {
+    modulus >= 1 << 62
+}
+
+/// `(x mod q, y mod q)` for a wide `q`, where Goldilocks needs a single comparison per operand;
+/// the operands unchanged otherwise.
+#[inline(always)]
+fn canonical_wide(x: u64, y: u64, modulus: u64) -> (u64, u64) {
+    if modulus == goldilocks::P {
+        (goldilocks::reduce64(x), goldilocks::reduce64(y))
+    } else if is_wide(modulus) {
+        (x % modulus, y % modulus)
+    } else {
+        (x, y)
+    }
+}
+
+/// `input^-1 mod modulus` by the extended Euclidean algorithm. The Bezout coefficients stay below
+/// `modulus` in magnitude and `quotient * y` below `2 modulus`, so they fit in `i128` for any
+/// `modulus < 2^64`.
 pub fn inverse_mod(input: u64, modulus: u64) -> u64 {
+    if modulus == goldilocks::P {
+        return goldilocks::inv(input);
+    }
     let mut a = input % modulus;
     if a == 0 {
         panic!("input does not have inverse");
@@ -50,16 +78,19 @@ pub fn inverse_mod(input: u64, modulus: u64) -> u64 {
         return 0;
     }
 
-    let m0 = modulus as i64;
+    let m0 = modulus as i128;
     let mut modulus = modulus;
-    let mut y: i64 = 0;
-    let mut x: i64 = 1;
+    let mut y: i128 = 0;
+    let mut x: i128 = 1;
 
     while a > 1 {
-        let q = (a / modulus) as i64;
-        let t = modulus as i64;
+        if modulus == 0 {
+            panic!("input does not have inverse");
+        }
+        let q = (a / modulus) as i128;
+        let t = modulus;
         modulus = a % modulus;
-        a = t as u64;
+        a = t;
 
         let t = y;
         y = x - q * y;
@@ -75,7 +106,13 @@ pub fn inverse_mod(input: u64, modulus: u64) -> u64 {
 
 #[inline(always)]
 pub fn barrett_reduce_128(input_hi: u64, input_lo: u64, modulus: u64) -> u64 {
-    debug_assert!(modulus >= 4 && modulus < (1u64 << 62));
+    if modulus == goldilocks::P {
+        return goldilocks::reduce128((input_hi as u128) << 64 | input_lo as u128);
+    }
+    if is_wide(modulus) {
+        return (((input_hi as u128) << 64 | input_lo as u128) % modulus as u128) as u64;
+    }
+    debug_assert!(modulus >= 4);
 
     let ceil_log_mod = log2(modulus) + 1;
     let prod_right_shift = ceil_log_mod - 2;
@@ -89,14 +126,17 @@ pub fn barrett_reduce_128(input_hi: u64, input_lo: u64, modulus: u64) -> u64 {
 }
 
 pub fn multiply_mod(x: u64, y: u64, modulus: u64) -> u64 {
-    debug_assert!(modulus >= 4 && modulus < (1u64 << 62));
+    debug_assert!(modulus >= 4);
     debug_assert!(x < modulus, "x must be < modulus");
     debug_assert!(y < modulus, "y must be < modulus");
     let (prod_hi, prod_lo) = multiply_u64_full(x, y);
     barrett_reduce_128(prod_hi, prod_lo, modulus)
 }
 
+/// Shoup's product: `x y - q modulus` lands in `[0, 2 modulus)`, which needs `modulus < 2^63`;
+/// wide moduli are routed elsewhere.
 pub fn multiply_mod_precon(x: u64, y: u64, y_precon: u64, modulus: u64) -> u64 {
+    debug_assert!(!is_wide(modulus));
     let mut q = multiply_u64_hi::<64>(x, y_precon);
     q = x.wrapping_mul(y).wrapping_sub(q.wrapping_mul(modulus));
     if q >= modulus {
@@ -106,23 +146,30 @@ pub fn multiply_mod_precon(x: u64, y: u64, y_precon: u64, modulus: u64) -> u64 {
     }
 }
 
+/// `x + y mod modulus` for any `modulus < 2^64`: past `2^63` the sum can carry out of the `u64`,
+/// and is then at least `modulus` too.
 pub fn add_uint_mod(x: u64, y: u64, modulus: u64) -> u64 {
+    // For a wide modulus a non-canonical operand gives a wrong sum rather than a lazily reduced
+    // one, and only a debug build would notice, so reduce the operands there.
+    let (x, y) = canonical_wide(x, y, modulus);
     debug_assert!(x < modulus, "x must be < modulus");
     debug_assert!(y < modulus, "y must be < modulus");
-    let sum = x + y;
-    if sum >= modulus {
-        sum - modulus
+    let (sum, carry) = x.overflowing_add(y);
+    if carry || sum >= modulus {
+        sum.wrapping_sub(modulus)
     } else {
         sum
     }
 }
 
+/// `x - y mod modulus` for any `modulus < 2^64`, without forming `x + modulus`.
 pub fn sub_uint_mod(x: u64, y: u64, modulus: u64) -> u64 {
+    let (x, y) = canonical_wide(x, y, modulus);
     debug_assert!(x < modulus, "x must be < modulus");
     debug_assert!(y < modulus, "y must be < modulus");
-    let diff = x + modulus - y;
-    if diff >= modulus {
-        diff - modulus
+    let (diff, borrow) = x.overflowing_sub(y);
+    if borrow {
+        diff.wrapping_add(modulus)
     } else {
         diff
     }

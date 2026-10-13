@@ -13,7 +13,7 @@ use crate::{
 };
 
 #[cfg(test)]
-use crate::common::config::MOD_Q;
+use crate::common::arithmetic::signed_mod_q;
 
 /// Sumcheck for the multilinear equality check `eq(x, selector)`.
 /// It evaluates to 1 exactly when the first `selector_variable_count` bits of
@@ -426,10 +426,7 @@ mod tests {
         // current_claim was 1, now becomes 1*(1-r2) = 1-19
         debug_assert_eq!(
             claim_after_r2,
-            RingElement::constant(
-                (MOD_Q as i64 + 1 - 19) as u64 % MOD_Q,
-                Representation::IncompleteNTT
-            )
+            RingElement::constant(signed_mod_q(1 - 19), Representation::IncompleteNTT)
         );
 
         sumcheck.univariate_polynomial_into(&mut polynomial);
@@ -448,10 +445,7 @@ mod tests {
         // current_claim was (1-r2), now becomes (1-r2)*r3 = (1-19)*743
         debug_assert_eq!(
             claim_after_r3,
-            RingElement::constant(
-                (((MOD_Q as i64 + 1 - 19) * 743) as u64) % MOD_Q,
-                Representation::IncompleteNTT
-            )
+            RingElement::constant(signed_mod_q((1 - 19) * 743), Representation::IncompleteNTT)
         );
 
         debug_assert_eq!(sumcheck.final_evaluations(), &claim_after_r3);
