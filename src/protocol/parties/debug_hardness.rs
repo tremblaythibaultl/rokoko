@@ -10,7 +10,7 @@ use crate::{
         estimator::{estimate_rsis_security, RSISParameters},
         norms,
         ring_arithmetic::{Representation, RingElement},
-        short_challenge::T_OP_NORM_BOUND,
+        short_challenge::GAMMA_C,
     },
     protocol::{
         commitment::{RecursionConfig, RecursiveCommitmentWithAux},
@@ -31,8 +31,10 @@ const JL_ALPHA_RP: f64 = 5.477225575051661;
 /// Fw' =  F(v - v'') = y(c - c'') = yz'
 /// Then, if (w, z) \neq (w', z'), we have 
 /// F(wz' - w'z) = 0
-/// (wz' - w'z) = (v - v')(c- c') - (v - v'')(c - c'') \leq 6 op_norm_bound * v_norm
-/// as vc - vc cancels out
+/// (wz' - w'z) = (v - v')(c- c') - (v - v'')(c - c'') \leq 6 gamma_C * v_norm
+/// as vc - vc cancels out,
+/// with gamma_C the challenges' coefficient operator norm, `GAMMA_C` (sqrt(3) * op_norm_bound
+/// for the trinomial family).
 /// cf. https://github.com/lattice-dogs/labrador/blob/8b6626b26afd4c0162ddd089759d21d3d51bfbdf/greyhound.c#L42
 const EXTRACTION_SLACK: f64 = 6.0;
 
@@ -273,7 +275,7 @@ pub fn check_sumcheck_round(
         );
 
 
-    let extracted_witness_bound = recomposed_witness_bound * T_OP_NORM_BOUND * EXTRACTION_SLACK;
+    let extracted_witness_bound = recomposed_witness_bound * GAMMA_C * EXTRACTION_SLACK;
 
     // Without the round's own projection claim the image is only covered by a containing
     // aggregate: the decomposed projection image is the outermost block of its own recursion and
@@ -422,7 +424,7 @@ pub fn check_intermediate_round(
 
 //     let projection_l2_norm = norms::l2_norm_coeffs(projection_image_ct_data);
 
-//     let extracted_witness_bound = recomposed_witness_bound * T_OP_NORM_BOUND * EXTRACTION_SLACK;
+//     let extracted_witness_bound = recomposed_witness_bound * GAMMA_C * EXTRACTION_SLACK;
 
 //     let argued_witness_bound = projection_l2_norm / JL_ALPHA_RP;
 
@@ -468,7 +470,7 @@ pub fn check_simple_round(
 
     let projection_l2_norm = norms::l2_norm_coeffs(projection_image_ct_data);
 
-    let extracted_witness_bound = folded_witness_l2_norm * T_OP_NORM_BOUND * EXTRACTION_SLACK * NORM_MARGIN;
+    let extracted_witness_bound = folded_witness_l2_norm * GAMMA_C * EXTRACTION_SLACK * NORM_MARGIN;
 
     let argued_witness_bound = projection_l2_norm / JL_ALPHA_RP;
     let worse_bound = if extracted_witness_bound > argued_witness_bound {

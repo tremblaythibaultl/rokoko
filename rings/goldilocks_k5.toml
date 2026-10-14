@@ -3,7 +3,7 @@
 family = "trinomial"
 degree = 96
 mod_q = 18446744069414584321 # 2^64 - 2^32 + 1
-# Provisional fold-challenge parameters. The short-challenge sampler still measures the operator
-# norm as for X^N + 1, so the bound below is a placeholder that rejects nothing.
-tau = 48 # provisional, uncalibrated: C(96,48) * 2^48 = 2^140.4 challenges
-op_norm_bound = 1000.0 # provisional, uncalibrated: rejects nothing
+# The operating point of the conductor-288 proposal: tau = 40, with invertible differences of
+# challenges, and a bound on ||sigma(c)||_inf at about 3 attempts, as for rings/n128_d4.toml.
+tau = 40 # C(96,40) * 2^40 = 2^130.47 challenges before rejection; Pr[non-invertible difference] in [2^-140.7, 2^-117.1]
+op_norm_bound = 12.4 # about 3.04 sampling attempts per challenge, 2^128.86 after rejection; gamma_C = sqrt(3) * 12.4 = 21.5

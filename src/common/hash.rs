@@ -466,4 +466,39 @@ mod tests {
         }
         assert!(checked > 0);
     }
+
+    /// The two challenge samplers at `p`. Field challenges (the diagonal of the homogenized
+    /// slots, `Z_p[tau]`, see `degree3_homogenization`) are fixed by conjugation. Fold challenges
+    /// come from the short-challenge sampler: ternary of weight `TAU`, and not in that field.
+    #[cfg(rokoko_family = "trinomial")]
+    #[test]
+    fn field_challenges_are_fixed_by_conjugation_and_fold_challenges_are_not() {
+        crate::common::init_common();
+        let mut transcript = HashWrapper::new();
+        transcript.update_with_u64(5);
+        let mut field = vec![RingElement::zero(Representation::IncompleteNTT); 8];
+        transcript.sample_ring_element_ntt_slots_same_vec_into(&mut field);
+        field.push(RingElement::zero(Representation::IncompleteNTT));
+        transcript.sample_ring_element_ntt_slots_into(field.last_mut().unwrap());
+        for r in &field {
+            assert_eq!(r.representation, Representation::IncompleteNTT);
+            assert_eq!(&r.conjugate(), r);
+        }
+        assert_ne!(field[0], field[1]);
+
+        let mut fold = vec![RingElement::zero(Representation::IncompleteNTT); 8];
+        transcript.sample_low_op_norm_ring_vec_into(&mut fold);
+        for c in &fold {
+            assert_eq!(c.representation, Representation::IncompleteNTT);
+            assert_ne!(&c.conjugate(), c);
+            let mut coefficients = c.clone();
+            coefficients.to_representation(Representation::Coefficients);
+            assert!(coefficients
+                .v
+                .iter()
+                .all(|&x| x == 0 || x == 1 || x == MOD_Q - 1));
+            let weight = coefficients.v.iter().filter(|&&x| x != 0).count();
+            assert_eq!(weight, crate::common::short_challenge::TAU);
+        }
+    }
 }
