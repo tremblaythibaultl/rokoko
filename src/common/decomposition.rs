@@ -1,5 +1,5 @@
 use crate::common::{
-    arithmetic::pow_mod,
+    arithmetic::{pow_mod, reduce_signed_wide},
     config::{DEGREE, MOD_Q},
     ring_arithmetic::{Representation, RingElement},
 };
@@ -33,10 +33,7 @@ pub fn decompose(input: &[RingElement], base_log: u64, radix: usize) -> Vec<Ring
     }
 
     let small_shift_val = 1u64 << (base_log - 1);
-    let mut big_shift_val: u64 = 0;
-    for i in 0..radix {
-        big_shift_val += small_shift_val << (i as u64 * base_log);
-    }
+    let big_shift_val = big_shift(base_log, radix, MOD_Q);
     let big_shift = RingElement::all(big_shift_val, Representation::StridedCoefficients);
     let mask = (1u64 << base_log) - 1;
     // A shifted coefficient at or past 2^window_bits is outside the window.
@@ -56,15 +53,10 @@ pub fn decompose(input: &[RingElement], base_log: u64, radix: usize) -> Vec<Ring
             temp.to_representation(Representation::StridedCoefficients);
             #[cfg(feature = "debug-decomp")]
             {
-                let q = crate::common::config::MOD_Q;
+                use crate::common::arithmetic::centered_i64_from_u64_mod_q_scalar as centered;
                 let mut local = 0i64;
                 for &c in temp.v.iter() {
-                    let s = if c > q / 2 {
-                        c as i64 - q as i64
-                    } else {
-                        c as i64
-                    };
-                    local = local.max(s.abs());
+                    local = local.max(centered(c).abs());
                 }
                 call_max.fetch_max(local, std::sync::atomic::Ordering::Relaxed);
             }
@@ -74,18 +66,20 @@ pub fn decompose(input: &[RingElement], base_log: u64, radix: usize) -> Vec<Ring
 
             for (i, slot) in slots.iter_mut().enumerate() {
                 let from = i as u64 * base_log;
-                for (out, coefficient) in digit.v.iter_mut().zip(temp.v.iter()) {
-                    let value = (coefficient >> from) & mask;
-                    *out = if value >= small_shift_val {
-                        value - small_shift_val
-                    } else {
-                        value + MOD_Q - small_shift_val
-                    };
+                for (out, &coefficient) in digit.v.iter_mut().zip(temp.v.iter()) {
+                    *out = balanced_digit(coefficient, from, mask, small_shift_val, MOD_Q);
                 }
                 if outside {
                     for (out, &coefficient) in digit.v.iter_mut().zip(temp.v.iter()) {
                         if coefficient >> window_bits != 0 {
-                            *out = carried_digit(coefficient, big_shift_val, base_log, radix, i);
+                            *out = carried_digit(
+                                coefficient,
+                                big_shift_val,
+                                base_log,
+                                radix,
+                                i,
+                                MOD_Q,
+                            );
                         }
                     }
                 }
@@ -116,10 +110,8 @@ pub fn decompose(input: &[RingElement], base_log: u64, radix: usize) -> Vec<Ring
     let call_max = call_max.load(std::sync::atomic::Ordering::Relaxed);
     #[cfg(feature = "debug-decomp")]
     {
-        let capacity_neg = (big_shift_val as i64).min(1 << 62);
-        let capacity_pos = ((1u64 << (base_log * radix as u64)).wrapping_sub(big_shift_val))
-            .min(1 << 62) as i64
-            - 1;
+        let capacity_neg = big_shift_val.min(1 << 62) as i64;
+        let capacity_pos = ((1u128 << window_bits) - big_shift_val as u128).min(1 << 62) as i64 - 1;
         tracing::debug!(
             "  [debug] decompose base={} radix={} n={} max|coeff|={} window=[-{}, {}]",
             base_log,
@@ -134,22 +126,57 @@ pub fn decompose(input: &[RingElement], base_log: u64, radix: usize) -> Vec<Ring
     decomposed
 }
 
+/// The shift `k = (b/2) Σ_{i < radix} b^i`, `b = 2^base_log`. A window past `log2 q` makes
+/// `k >= q`; below `2^62` it is kept whole, as it always was, and the shifting add subtracts `q`
+/// once, so `t` is the integer `x + k` less `q` or not and the digits recompose to `x` mod q (the
+/// proofs of the existing rings depend on these digits). Past 64 bits, or for a wide `q`, whose
+/// add takes canonical operands only, it is reduced mod `q`.
+fn big_shift(base_log: u64, radix: usize, q: u64) -> u64 {
+    assert!(
+        base_log * (radix as u64) < 128,
+        "a {radix}-digit base-2^{base_log} window does not fit 128 bits"
+    );
+    let k: u128 = (0..radix as u64)
+        .map(|i| 1u128 << (base_log - 1 + i * base_log))
+        .sum();
+    match u64::try_from(k) {
+        Ok(k) if q < 1 << 62 => k,
+        _ => (k % q as u128) as u64,
+    }
+}
+
+/// The bits `from..from + base_log` of the shifted coefficient `t`, less `half = b/2`, as a
+/// residue mod `q`. A `u64` has no bits from 64 on, so a digit there is `-b/2`.
+#[inline(always)]
+fn balanced_digit(t: u64, from: u64, mask: u64, half: u64, q: u64) -> u64 {
+    let value = (t >> from.min(63)) & if from < 64 { mask } else { 0 };
+    if value >= half {
+        value - half
+    } else {
+        q - (half - value)
+    }
+}
+
 /// Digit `i` of a coefficient whose shifted value `t = x + k mod q` is past the window. The
 /// lower digits are those of the integer `x + k`, with `x` the centered representative, and the
 /// top digit takes everything above them, so `Σ d_i b^i = x` exactly and only the top digit leaves
-/// `[-b/2, b/2)`.
-fn carried_digit(t: u64, big_shift: u64, base_log: u64, radix: usize, i: usize) -> u64 {
-    let q = MOD_Q as i64;
-    let x = t as i64 - big_shift as i64;
-    let shifted = if x > q / 2 { t as i64 - q } else { t as i64 };
-    let half = 1i64 << (base_log - 1);
+/// `[-b/2, b/2)`. Signed values are `i128` so that any `q < 2^64` fits.
+fn carried_digit(t: u64, big_shift: u64, base_log: u64, radix: usize, i: usize, q: u64) -> u64 {
+    let q_signed = q as i128;
+    let x = t as i128 - big_shift as i128;
+    let shifted = if x > q_signed / 2 {
+        t as i128 - q_signed
+    } else {
+        t as i128
+    };
+    let half = 1i128 << (base_log - 1);
     let above = shifted >> (i as u64 * base_log);
     let digit = if i + 1 == radix {
         above - half
     } else {
-        (above & ((1i64 << base_log) - 1)) - half
+        (above & ((1i128 << base_log) - 1)) - half
     };
-    digit.rem_euclid(q) as u64
+    reduce_signed_wide(digit, q)
 }
 
 // Decomposes each element in input into radix unsigned binary digits of its representative in [0, q).
@@ -174,7 +201,7 @@ pub fn decompose_bits(input: &[RingElement], radix: usize) -> Vec<RingElement> {
         temp.set_from(el);
         // Bit extraction is per coefficient, so the strided ordering is irrelevant here.
         temp.to_representation(Representation::StridedCoefficients);
-        debug_assert!(temp.v.iter().all(|&c| c < (1u64 << n_bits)));
+        debug_assert!(temp.v.iter().all(|&c| c < MOD_Q));
 
         let digits = &mut decomposed[index * radix..index * radix + n_bits];
         for (i, d) in digits.iter_mut().enumerate() {
@@ -306,14 +333,8 @@ fn test_decompose() {
 
 #[test]
 fn out_of_window_coefficients_carry_into_the_top_digit() {
-    let q = MOD_Q as i64;
-    let centered = |x: u64| {
-        if x > MOD_Q / 2 {
-            x as i64 - q
-        } else {
-            x as i64
-        }
-    };
+    use crate::common::arithmetic::{centered_i64_from_u64_mod_q_scalar as centered, signed_mod_q};
+    let half_q = (MOD_Q / 2) as i64;
     for (base_log, radix) in [(8u64, 2usize), (7, 2), (4, 4)] {
         let half = 1i64 << (base_log - 1);
         let shift: i64 = (0..radix).map(|i| half << (i as u64 * base_log)).sum();
@@ -330,12 +351,12 @@ fn out_of_window_coefficients_carry_into_the_top_digit() {
             -40000,
             3 * past,
             -3 * shift,
-            q / 2,
-            -(q / 2),
+            half_q,
+            -half_q,
         ];
         let mut element = RingElement::zero(Representation::Coefficients);
         for (c, &x) in element.v.iter_mut().zip(values.iter()) {
-            *c = x.rem_euclid(q) as u64;
+            *c = signed_mod_q(x);
         }
         element.to_representation(Representation::IncompleteNTT);
 
@@ -366,8 +387,10 @@ fn out_of_window_coefficients_carry_into_the_top_digit() {
 fn test_random_mod_q() {
     let r = RingElement::random(Representation::IncompleteNTT);
     let data = vec![r];
-    let base_log = 13; // do we cover 52 bits?
-    let radix = 4;
+    let base_log = 13;
+    // Enough digits to cover `q`: `ceil(bits(q) / 13)`, so 4 for the 50-bit rings and 5 for
+    // Goldilocks.
+    let radix = (64 - MOD_Q.leading_zeros() as u64).div_ceil(base_log) as usize;
 
     let mut decomposed = decompose(&data, base_log, radix);
 
@@ -516,4 +539,73 @@ fn test_decompose_bits_preserves_input() {
     let _ = decompose_bits(&input, 64);
 
     debug_assert_eq!(input, before);
+}
+
+/// The digit arithmetic of `decompose` at the Goldilocks prime, where the centered values and the
+/// shift leave `i64` and windows reach past 64 bits: every value recomposes to itself mod p, and
+/// every digit but a carried top one is balanced.
+#[test]
+fn digits_recompose_at_goldilocks() {
+    const P: u64 = incomplete_rexl::GOLDILOCKS_P;
+    let half_p = (P / 2) as i128;
+    let centered = |d: u64| match d > P / 2 {
+        true => d as i128 - P as i128,
+        false => d as i128,
+    };
+    let mut state = 0x9E3779B97F4A7C15u64;
+    let mut random = || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        state as i64 as i128 >> (state % 63)
+    };
+    for (base_log, radix) in [(16u64, 4usize), (22, 3), (8, 8), (13, 4), (21, 3), (9, 2)] {
+        let k = big_shift(base_log, radix, P);
+        let (window, half) = (base_log * radix as u64, 1i128 << (base_log - 1));
+        let mut values = vec![
+            0,
+            1,
+            -1,
+            half_p,
+            -half_p,
+            half,
+            -half - 1,
+            1 << 40,
+            -(1 << 40),
+        ];
+        values.extend((0..64).map(|_| random()));
+        for x in values {
+            let t = reduce_signed_wide(x + k as i128, P);
+            let carried = window < 64 && t >> window != 0;
+            let digits: Vec<u64> = (0..radix)
+                .map(|i| match carried {
+                    true => carried_digit(t, k, base_log, radix, i, P),
+                    false => balanced_digit(
+                        t,
+                        i as u64 * base_log,
+                        (1 << base_log) - 1,
+                        1 << (base_log - 1),
+                        P,
+                    ),
+                })
+                .collect();
+            let (mut recomposed, mut weight) = (0u128, 1u128);
+            for (i, &d) in digits.iter().enumerate() {
+                recomposed = (recomposed + d as u128 * weight) % P as u128;
+                weight = (weight << base_log) % P as u128;
+                if i + 1 < radix || !carried {
+                    assert!(
+                        (-half..half).contains(&centered(d)),
+                        "digit {i} of {x} is {} for base 2^{base_log}",
+                        centered(d)
+                    );
+                }
+            }
+            assert_eq!(
+                recomposed as u64,
+                reduce_signed_wide(x, P),
+                "{x} in base 2^{base_log}, {radix} digits"
+            );
+        }
+    }
 }

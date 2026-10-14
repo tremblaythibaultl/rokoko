@@ -273,21 +273,22 @@ pub fn sumcheck_verifier(
 
     if let Some(constant_term_claims) = &round_proof.constant_term_claims {
         for ct_claim in constant_term_claims.iter() {
-            let ct = ct_claim.constant_term_from_incomplete_ntt();
+            // `Tr(r_i) = 0`, checked as `Tr/phi`: the constant term for `X^N + 1`.
+            let ct = ct_claim.trace_over_degree();
             assert_eq!(ct, 0);
         }
     }
 
-    let norm_ct = round_proof.norm_claim.constant_term_from_incomplete_ntt();
+    // The norm claims below are `<w, conj w>`, whose `Tr/phi` is the squared canonical norm over
+    // the degree (the constant term for `X^N + 1`; the note, Corollary 4.4).
+    let norm_ct = round_proof.norm_claim.trace_over_degree();
     assert_norm_bounded(
         "norm claim via inner-product",
         (norm_ct as f64).sqrt(),
         config.norm_bound,
     );
 
-    let most_inner_norm_ct = round_proof
-        .most_inner_norm_claim
-        .constant_term_from_incomplete_ntt();
+    let most_inner_norm_ct = round_proof.most_inner_norm_claim.trace_over_degree();
     assert_norm_bounded(
         "most inner norm claim via inner-product",
         (most_inner_norm_ct as f64).sqrt(),
@@ -295,7 +296,7 @@ pub fn sumcheck_verifier(
     );
 
     if let Some(projection_norm_claim) = projection_norm_claim {
-        let projection_norm_ct = projection_norm_claim.constant_term_from_incomplete_ntt();
+        let projection_norm_ct = projection_norm_claim.trace_over_degree();
         assert_norm_bounded(
             "projection image norm claim via inner-product",
             (projection_norm_ct as f64).sqrt(),

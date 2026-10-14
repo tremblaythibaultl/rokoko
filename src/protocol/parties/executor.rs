@@ -204,7 +204,8 @@ fn check_prover_claims_match_witness(
 }
 
 /// SNARK mode: prove user-supplied sumcheck claims about a committed witness,
-/// then run the PCS chain on the resulting evaluation claims.
+/// then run the PCS chain on the resulting evaluation claims. Not ported to the trinomial family.
+#[cfg(not(rokoko_family = "trinomial"))]
 pub fn execute_snark(inst: &Instantiation) {
     use crate::common::{
         hash::HashWrapper,

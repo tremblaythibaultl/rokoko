@@ -1,7 +1,7 @@
 use crate::common::{ring_arithmetic::RingElement, sumcheck_element::SumcheckElement};
 
 #[cfg(test)]
-use crate::common::{config::MOD_Q, ring_arithmetic::Representation};
+use crate::common::ring_arithmetic::Representation;
 
 #[derive(Debug, Clone)]
 pub struct StructuredRow<E: SumcheckElement = RingElement> {
@@ -85,6 +85,7 @@ impl<E: SumcheckElement> PreprocessedRow<E> {
 
 #[test]
 fn test_structured_row() {
+    use crate::common::arithmetic::signed_mod_q;
     use crate::common::ring_arithmetic::RingElement;
 
     let tensor_layers = vec![
@@ -97,56 +98,56 @@ fn test_structured_row() {
     debug_assert_eq!(
         structured_row.at(0),
         RingElement::constant(
-            (MOD_Q as i64 + (1 - 2) * (1 - 3) * (1 - 5)) as u64, // 0 0 0
+            signed_mod_q((1 - 2) * (1 - 3) * (1 - 5)), // 0 0 0
             Representation::IncompleteNTT
         )
     );
     debug_assert_eq!(
         structured_row.at(1),
         RingElement::constant(
-            (MOD_Q as i64 + 2 * (1 - 3) * (1 - 5)) as u64, // 0 0 1
+            signed_mod_q(2 * (1 - 3) * (1 - 5)), // 0 0 1
             Representation::IncompleteNTT
         )
     );
     debug_assert_eq!(
         structured_row.at(2),
         RingElement::constant(
-            (MOD_Q as i64 + (1 - 2) * 3 * (1 - 5)) as u64, // 0 1 0
+            signed_mod_q((1 - 2) * 3 * (1 - 5)), // 0 1 0
             Representation::IncompleteNTT
         )
     );
     debug_assert_eq!(
         structured_row.at(3),
         RingElement::constant(
-            (MOD_Q as i64 + 2 * 3 * (1 - 5)) as u64, // 0 1 1
+            signed_mod_q(2 * 3 * (1 - 5)), // 0 1 1
             Representation::IncompleteNTT
         )
     );
     debug_assert_eq!(
         structured_row.at(4),
         RingElement::constant(
-            (MOD_Q as i64 + (1 - 2) * (1 - 3) * 5) as u64, // 1 0 0
+            signed_mod_q((1 - 2) * (1 - 3) * 5), // 1 0 0
             Representation::IncompleteNTT
         )
     );
     debug_assert_eq!(
         structured_row.at(5),
         RingElement::constant(
-            (MOD_Q as i64 + 2 * (1 - 3) * 5) as u64, // 1 0 1
+            signed_mod_q(2 * (1 - 3) * 5), // 1 0 1
             Representation::IncompleteNTT
         )
     );
     debug_assert_eq!(
         structured_row.at(6),
         RingElement::constant(
-            (MOD_Q as i64 + (1 - 2) * 3 * 5) as u64, // 1 1 0
+            signed_mod_q((1 - 2) * 3 * 5), // 1 1 0
             Representation::IncompleteNTT
         )
     );
     debug_assert_eq!(
         structured_row.at(7),
         RingElement::constant(
-            (MOD_Q as i64 + 2 * 3 * 5) as u64, // 1 1 1
+            signed_mod_q(2 * 3 * 5), // 1 1 1
             Representation::IncompleteNTT
         )
     );

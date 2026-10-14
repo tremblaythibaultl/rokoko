@@ -1,6 +1,6 @@
 use crate::{
     common::{
-        arithmetic::{pow_mod, HALF_WAY_MOD_Q},
+        arithmetic::{pow_mod, HALF_WAY_MOD_Q, LAZY_REDUCTION},
         config::{MOD_Q, NOF_BATCHES, SLOT_DEGREE},
         projection_matrix::ProjectionMatrix,
         ring_arithmetic::{FieldExtension, Representation, RingElement},
@@ -360,6 +360,11 @@ pub(crate) fn split_projection_flatter(
     (projection_flatter_0, projection_flatter_1)
 }
 
+// The lazy kernels of `projection_flatter_1_times_matrix` transpose `SLOT_DEGREE.ilog2()` times
+// and group `16 / SLOT_DEGREE` chunks, which assumes slots of degree 2 or 4. Degree-3 slots (the
+// trinomial family) come with Goldilocks, past `LAZY_REDUCTION`, so only the exact path serves them.
+const _: () = assert!(!LAZY_REDUCTION || matches!(SLOT_DEGREE, 2 | 4));
+
 /// Computes the product of projection_flatter_1 with the projection matrix.
 ///
 /// This function computes the linear combination:
@@ -383,6 +388,9 @@ pub fn projection_flatter_1_times_matrix(
     projection_matrix: &ProjectionMatrix,
     projection_flatter_1: &PreprocessedRow,
 ) -> Vec<FieldExtension> {
+    if !LAZY_REDUCTION {
+        return projection_flatter_1_times_matrix_exact(projection_matrix, projection_flatter_1);
+    }
     #[cfg(target_arch = "aarch64")]
     {
         use std::arch::aarch64::*;
@@ -570,6 +578,8 @@ unsafe fn flatter_1_times_matrix_by_subset_sums(
     Some(result_field)
 }
 
+/// Lazy kernels only, so `SLOT_DEGREE` is 2 or 4 (see the assertion above
+/// [`projection_flatter_1_times_matrix`]).
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
 const COARSE_GROUP: usize = 16 / SLOT_DEGREE;
 
@@ -615,10 +625,36 @@ unsafe fn columns_times_matrix<const G: usize>(
     }
 }
 
+/// [`projection_flatter_1_times_matrix`] for moduli past `LAZY_REDUCTION`: each slot-zero
+/// coefficient's column sums exactly, reduced once.
+fn projection_flatter_1_times_matrix_exact(
+    projection_matrix: &ProjectionMatrix,
+    projection_flatter_1: &PreprocessedRow,
+) -> Vec<FieldExtension> {
+    let height = projection_matrix.projection_height;
+    let inner_width = projection_matrix.projection_ratio * height;
+    let slot_zero: Vec<FieldExtension> = projection_flatter_1.preprocessed_row[..height]
+        .iter()
+        .map(|w| w.slot_zero())
+        .collect();
+    let mut result_field = vec![FieldExtension::zero(); inner_width];
+    for k in 0..SLOT_DEGREE {
+        let weights: Vec<u64> = slot_zero.iter().map(|w| w.coeffs[k]).collect();
+        let sums = projection_matrix.signed_column_sums_mod(&weights, MOD_Q);
+        for (result, sum) in result_field.iter_mut().zip(sums) {
+            result.coeffs[k] = sum;
+        }
+    }
+    result_field
+}
+
 pub fn projection_flatter_1_times_matrix_ref(
     projection_matrix: &ProjectionMatrix,
     projection_flatter_1: &PreprocessedRow,
 ) -> Vec<FieldExtension> {
+    if !LAZY_REDUCTION {
+        return projection_flatter_1_times_matrix_exact(projection_matrix, projection_flatter_1);
+    }
     let height = projection_matrix.projection_height;
     let projection_ratio = projection_matrix.projection_ratio;
     let inner_width = projection_ratio * height;
@@ -685,10 +721,17 @@ mod tests {
                         })
                         .collect(),
                 };
+                let reference =
+                    projection_flatter_1_times_matrix_ref(&projection_matrix, &flatter_1);
                 assert_eq!(
                     projection_flatter_1_times_matrix(&projection_matrix, &flatter_1),
-                    projection_flatter_1_times_matrix_ref(&projection_matrix, &flatter_1),
+                    reference,
                     "ratio {ratio}, height {height}, top {top}"
+                );
+                assert_eq!(
+                    projection_flatter_1_times_matrix_exact(&projection_matrix, &flatter_1),
+                    reference,
+                    "exact, ratio {ratio}, height {height}, top {top}"
                 );
             }
         }

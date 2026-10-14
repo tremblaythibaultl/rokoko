@@ -1,5 +1,5 @@
 use incomplete_rexl as hexl;
-pub use incomplete_rexl::SlotRing;
+pub use incomplete_rexl::{SlotRing, TrinomialSlotRing};
 
 #[inline(always)]
 unsafe fn slice_from_raw<'a>(ptr: *const u64, n: u64) -> &'a [u64] {

@@ -257,7 +257,7 @@ fn ring_vectors() {
                     assert_eq!([y[j], y[slots + j], y[2 * slots + j]], r);
                 }
                 "tau" => tau = Some(v),
-                // Ring-level operations, outside the slot transform: not checked here.
+                // Ring-level operations, checked by the main crate.
                 "conj" | "trace" => {}
                 _ => panic!("unknown op {op}"),
             }

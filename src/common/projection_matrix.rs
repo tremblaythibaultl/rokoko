@@ -1,3 +1,4 @@
+use crate::common::arithmetic::reduce_signed_wide;
 use crate::common::hash::HashWrapper;
 use crate::common::matrix::HorizontallyAlignedMatrix;
 use std::ops::Index;
@@ -232,6 +233,51 @@ impl ProjectionMatrix {
     pub fn row_chunks(&self, row: usize) -> (&[u8], &[u8]) {
         (self.pos_masks().row(row), self.non_zero_masks().row(row))
     }
+
+    /// `(col, +1 or -1)` for the non-zero entries of `row`.
+    fn signed_entries(&self, row: usize) -> impl Iterator<Item = (usize, bool)> + '_ {
+        let (pos, non_zero) = self.row_chunks(row);
+        pos.iter()
+            .zip(non_zero)
+            .enumerate()
+            .flat_map(|(chunk, (&pos, &non_zero))| {
+                (0..8)
+                    .filter(move |bit| non_zero >> bit & 1 == 1)
+                    .map(move |bit| (8 * chunk + bit, pos >> bit & 1 == 1))
+            })
+    }
+
+    /// `Σ_row J[row, col] weights[row] mod q` for every column, for residues `weights[row] < q` and
+    /// any `q < 2^64`. A column sums at most `projection_height` terms below `2^64`, so the sums
+    /// stay exact in `i128` and are reduced once. This is the path for the moduli the biased `u64`
+    /// kernels do not cover (`LAZY_REDUCTION`).
+    pub fn signed_column_sums_mod(&self, weights: &[u64], q: u64) -> Vec<u64> {
+        let mut sums = vec![0i128; self.projection_width];
+        for (row, &weight) in weights[..self.projection_height].iter().enumerate() {
+            for (col, positive) in self.signed_entries(row) {
+                match positive {
+                    true => sums[col] += weight as i128,
+                    false => sums[col] -= weight as i128,
+                }
+            }
+        }
+        sums.into_iter()
+            .map(|sum| reduce_signed_wide(sum, q))
+            .collect()
+    }
+
+    /// `Σ_col J[row, col] x(col) mod q` for residues `x(col) < q` and any `q < 2^64`, exact as
+    /// [`Self::signed_column_sums_mod`] is.
+    pub fn signed_row_sum_mod(&self, row: usize, x: impl Fn(usize) -> u64, q: u64) -> u64 {
+        let mut sum = 0i128;
+        for (col, positive) in self.signed_entries(row) {
+            match positive {
+                true => sum += x(col) as i128,
+                false => sum -= x(col) as i128,
+            }
+        }
+        reduce_signed_wide(sum, q)
+    }
 }
 
 #[cfg(all(
@@ -244,7 +290,9 @@ impl ProjectionMatrix {
 impl ProjectionMatrix {
     /// `acc(w, chunk) += Σ_row weights[w][row] · J[row, 8 chunk + l]` in lane `l`, or false unless
     /// `J` is sampled, `16 | height, width` and `weights`, `capacity` cover `J`. Four-Russians over
-    /// rows: 4-bit (+1)- and (−1)-column patterns index the 16 subset sums of four weights.
+    /// rows: 4-bit (+1)- and (−1)-column patterns index the 16 subset sums of four weights. The
+    /// sums wrap mod `2^64`, so callers bias `acc` by `HALF_WAY_MOD_Q` and take this path only
+    /// under `LAZY_REDUCTION`.
     ///
     /// # Safety
     /// `acc(w, chunk)` for `w < W`, `chunk < capacity` are distinct, aligned, writable vectors.
@@ -890,5 +938,55 @@ mod tests {
         debug_assert_eq!(projection_matrix[(3, 1)], (false, true));
         debug_assert_eq!(projection_matrix[(1, 4)], (true, true));
         debug_assert_eq!(projection_matrix[(2, 3)], (false, false));
+    }
+
+    /// The exact sums against entry-by-entry modular accumulation, at the ring's modulus and at the
+    /// Goldilocks prime, with weights and inputs at the top of the range.
+    #[test]
+    fn exact_signed_sums_match_modular_accumulation() {
+        use crate::common::config::MOD_Q;
+        use incomplete_rexl::{add_mod, sub_mod, GOLDILOCKS_P};
+        let mut hash_wrapper = HashWrapper::new();
+        for q in [MOD_Q, GOLDILOCKS_P] {
+            for (ratio, height) in [(1, 8), (2, 256), (8, 144), (32, 16)] {
+                let mut projection_matrix = ProjectionMatrix::new(ratio, height);
+                projection_matrix.sample(&mut hash_wrapper);
+                let width = projection_matrix.projection_width;
+                let weights: Vec<u64> = (0..height)
+                    .map(|row| match row % 3 {
+                        0 => q - 1,
+                        1 => hash_wrapper.sample_u64() % q,
+                        _ => q / 2,
+                    })
+                    .collect();
+                let x = |col: usize| match col % 2 {
+                    0 => q - 1 - col as u64,
+                    _ => col as u64,
+                };
+                let signed = |acc: u64, entry: (bool, bool), value: u64| match entry {
+                    (true, true) => add_mod(acc, value, q),
+                    (false, true) => sub_mod(acc, value, q),
+                    _ => acc,
+                };
+
+                let sums = projection_matrix.signed_column_sums_mod(&weights, q);
+                for col in 0..width {
+                    let expected = (0..height).fold(0, |acc, row| {
+                        signed(acc, projection_matrix[(row, col)], weights[row])
+                    });
+                    assert_eq!(sums[col], expected, "q {q}, column {col}");
+                }
+                for row in 0..height {
+                    let expected = (0..width).fold(0, |acc, col| {
+                        signed(acc, projection_matrix[(row, col)], x(col))
+                    });
+                    assert_eq!(
+                        projection_matrix.signed_row_sum_mod(row, x, q),
+                        expected,
+                        "q {q}, row {row}"
+                    );
+                }
+            }
+        }
     }
 }

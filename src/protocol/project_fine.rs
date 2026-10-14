@@ -2,8 +2,8 @@ use std::any::Any;
 
 use crate::{
     common::{
-        arithmetic::{precompute_structured_values_fast, HALF_WAY_MOD_Q_RING_CF},
-        config::{DEGREE, MOD_Q, NOF_BATCHES},
+        arithmetic::{precompute_structured_values_fast, HALF_WAY_MOD_Q_RING_CF, LAZY_REDUCTION},
+        config::{RingFamily, DEGREE, MOD_Q, NOF_BATCHES, RING_FAMILY},
         hash::HashWrapper,
         matrix::{HorizontallyAlignedMatrix, VerticallyAlignedMatrix},
         projection_matrix::ProjectionMatrix,
@@ -32,6 +32,9 @@ pub fn compute_j_batched(
     // ring elements.  Each ring element j_batched[i] accumulates:
     //   j_batched[i][d] = Σ_k  c_1[k] · J_embedded[k, i·DEGREE + d]
     // where J_embedded is the dual-embedded projection matrix.
+    if !LAZY_REDUCTION {
+        return compute_j_batched_exact(projection_matrix, c_1_values);
+    }
     let inner_width_ring =
         projection_matrix.projection_ratio * (projection_matrix.projection_height / DEGREE);
     let mut j_batched = vec![RingElement::zero(Representation::IncompleteNTT); inner_width_ring];
@@ -146,10 +149,34 @@ pub fn compute_j_batched(
     j_batched
 }
 
+/// [`compute_j_batched`] for moduli past `LAZY_REDUCTION`: the column sums exactly, then the same
+/// conversion to incomplete-NTT form and conjugation.
+fn compute_j_batched_exact(
+    projection_matrix: &ProjectionMatrix,
+    c_1_values: &[u64],
+) -> Vec<RingElement> {
+    let inner_width_ring =
+        projection_matrix.projection_ratio * (projection_matrix.projection_height / DEGREE);
+    let sums = projection_matrix.signed_column_sums_mod(c_1_values, MOD_Q);
+    sums.chunks_exact(DEGREE)
+        .take(inner_width_ring)
+        .map(|sums| {
+            let mut el = RingElement::zero(Representation::Coefficients);
+            el.v.copy_from_slice(sums);
+            el.to_representation(Representation::IncompleteNTT);
+            el.conjugate_in_place();
+            el
+        })
+        .collect()
+}
+
 pub fn compute_j_batched_collectively(
     projection_matrix: &ProjectionMatrix,
     c_1_values: &[Vec<u64>; NOF_BATCHES],
 ) -> [Vec<RingElement>; NOF_BATCHES] {
+    if !LAZY_REDUCTION {
+        return std::array::from_fn(|b| compute_j_batched_exact(projection_matrix, &c_1_values[b]));
+    }
     let inner_width_ring =
         projection_matrix.projection_ratio * (projection_matrix.projection_height / DEGREE);
     let mut j_batched: [Vec<RingElement>; NOF_BATCHES] = std::array::from_fn(|_| {
@@ -331,8 +358,21 @@ pub fn compute_j_batched_collectively(
     j_batched
 }
 
+// `reduce_conjugate_to_incomplete_ntt` and the lazy `compute_j_batched*` kernels assume `X^N + 1`
+// (negacyclic reversal, `SLOT_DEGREE.ilog2()` de-interleaving); the trinomial family is past
+// `LAZY_REDUCTION` and takes `compute_j_batched_exact`.
+const _: () = assert!(!LAZY_REDUCTION || matches!(RING_FAMILY, RingFamily::PowerOfTwo));
+
 /// The conjugate of `el mod q` in incomplete-NTT form, for `el` biased by `HALF_WAY_MOD_Q`.
+///
+/// Lazy kernels only: the AVX-512 path reverses `X^N + 1` coefficients and de-interleaves them by
+/// `SLOT_DEGREE.ilog2()` steps, which is wrong for the degree-3 slots of the trinomial family, whose
+/// modulus takes the exact path.
 fn reduce_conjugate_to_incomplete_ntt(el: &mut RingElement) {
+    assert!(
+        LAZY_REDUCTION && RING_FAMILY == RingFamily::PowerOfTwo,
+        "the lazy fine-projection kernels assume q < 2^50 and X^N + 1"
+    );
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
     if el.representation == Representation::Coefficients {
         unsafe {
@@ -405,6 +445,15 @@ fn reduce_conjugate_to_incomplete_ntt(el: &mut RingElement) {
 /// the accumulator, and 2× unrolls with a scalar tail.  The horizontal sum of
 /// the accumulator is added to the output coefficient.
 pub fn project_coefficients(
+    witness: &VerticallyAlignedMatrix<RingElement>,
+    projection_matrix: &ProjectionMatrix,
+) -> VerticallyAlignedMatrix<RingElement> {
+    project_coefficients_with::<{ !LAZY_REDUCTION }>(witness, projection_matrix)
+}
+
+/// [`project_coefficients`], with `EXACT` summing each row in `i128` instead of the biased
+/// accumulators (any `q < 2^64`).
+fn project_coefficients_with<const EXACT: bool>(
     witness: &VerticallyAlignedMatrix<RingElement>,
     projection_matrix: &ProjectionMatrix,
 ) -> VerticallyAlignedMatrix<RingElement> {
@@ -495,6 +544,16 @@ pub fn project_coefficients(
                     [current_projection_coeff_index];
                 // Compute the inner product: projection_subimage[inner_row] = J[inner_row, :] · subwitness
                 // J has (projection_ratio * PROJECTION_HEIGHT) columns
+
+                if EXACT {
+                    // Replaces the bias: the sum is exact and already reduced.
+                    *target = projection_matrix.signed_row_sum_mod(
+                        inner_row,
+                        |i| subwitness[i / DEGREE].v[i % DEGREE],
+                        MOD_Q,
+                    );
+                    continue;
+                }
 
                 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
                 {
@@ -1072,6 +1131,49 @@ mod tests {
         }
     }
 
+    /// The exact paths taken past `LAZY_REDUCTION` reproduce the biased kernels at `MOD_Q`.
+    #[test]
+    fn exact_projection_paths_match_the_lazy_kernels() {
+        crate::common::init_common();
+        let mut hash_wrapper = HashWrapper::new();
+        for (ratio, height, witness_height) in [(2, 256, 8), (4, 128, 8), (1, 256, 4)] {
+            let mut projection_matrix = ProjectionMatrix::new(ratio, height);
+            projection_matrix.sample(&mut hash_wrapper);
+            let mut data =
+                vec![RingElement::random(Representation::IncompleteNTT); 2 * witness_height];
+            data[0] = RingElement::all(MOD_Q - 1, Representation::Coefficients);
+            data[0].to_representation(Representation::IncompleteNTT);
+            let witness = VerticallyAlignedMatrix {
+                data,
+                width: 2,
+                height: witness_height,
+                used_cols: 2,
+            };
+            assert_eq!(
+                project_coefficients_with::<true>(&witness, &projection_matrix).data,
+                project_coefficients_with::<false>(&witness, &projection_matrix).data,
+                "ratio {ratio}, height {height}"
+            );
+        }
+        for (ratio, height) in [(2, 256), (32, 256), (8, 144)] {
+            let mut projection_matrix = ProjectionMatrix::new(ratio, height);
+            projection_matrix.sample(&mut hash_wrapper);
+            for top in [false, true] {
+                let c_1_values: Vec<u64> = (0..height)
+                    .map(|_| match top {
+                        false => hash_wrapper.sample_u64_mod_q(),
+                        true => MOD_Q - 1,
+                    })
+                    .collect();
+                assert_eq!(
+                    compute_j_batched_exact(&projection_matrix, &c_1_values),
+                    compute_j_batched(&projection_matrix, &c_1_values),
+                    "ratio {ratio}, height {height}, top {top}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn j_batched_collectively_matches_the_single_batch_kernel() {
         crate::common::init_common();
@@ -1125,6 +1227,9 @@ mod tests {
     fn reduce_conjugate_matches_ntt_then_conjugate() {
         use crate::common::arithmetic::HALF_WAY_MOD_Q;
         crate::common::init_common();
+        if !LAZY_REDUCTION {
+            return; // a lazy-only kernel: its inputs are biased by `HALF_WAY_MOD_Q`, 0 here
+        }
         let mut hash_wrapper = HashWrapper::new();
         let spread = 1u64 << 58;
         for case in 0..64 {

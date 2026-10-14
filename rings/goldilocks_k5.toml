@@ -1,0 +1,9 @@
+# Z_p[X]/(X^96 - X^48 + 1), the cyclotomic ring of conductor 9 * 2^5 = 288, over Goldilocks:
+# 32 cubic slots F_p[X]/(X^3 - eta_j).
+family = "trinomial"
+degree = 96
+mod_q = 18446744069414584321 # 2^64 - 2^32 + 1
+# Provisional fold-challenge parameters. The short-challenge sampler still measures the operator
+# norm as for X^N + 1, so the bound below is a placeholder that rejects nothing.
+tau = 48 # provisional, uncalibrated: C(96,48) * 2^48 = 2^140.4 challenges
+op_norm_bound = 1000.0 # provisional, uncalibrated: rejects nothing

@@ -16,6 +16,7 @@ use crate::common::ring_arithmetic::{FieldExtension, Representation, RingElement
 use crate::protocol::config::{
     IntermediateRoundProof, NextRoundCommitment, RoundProof, SimpleRoundProof, SumcheckRoundProof,
 };
+#[cfg(not(rokoko_family = "trinomial"))]
 use crate::protocol::snark::ClaimsProof;
 use crate::protocol::sumcheck_utils::polynomial::Polynomial;
 
@@ -29,7 +30,10 @@ const SCALE_BITS: u32 = 12;
 const SCALE: u32 = 1 << SCALE_BITS;
 const RANS_LOW: u32 = 1 << 16;
 const LANES: usize = 8;
-const SYMBOLS: usize = 56;
+/// Octaves `0..SYMBOLS`. A centred residue is at most `q/2 < 2^63`, so its octave is below
+/// `bitlen(q)` and 64 symbols cover any `q < 2^64`; below `2^55` the format keeps its 56 (the
+/// symbol count enters the cost estimate that picks coded over raw, so the bytes stay the same).
+const SYMBOLS: usize = if MOD_Q >> 55 == 0 { 56 } else { 64 };
 const ROLES: usize = 16;
 const MAX_ELEMENTS: usize = 1 << 20;
 const VERSION: u8 = 1;
@@ -52,6 +56,8 @@ enum Role {
     ProjectionCt,
     BatchedProjection,
     OpeningRhs,
+    // SNARK mode only; kept in every family so that the header always has `ROLES` models.
+    #[cfg_attr(rokoko_family = "trinomial", allow(dead_code))]
     WitnessEval,
 }
 
@@ -73,6 +79,26 @@ fn octave(c: i64) -> usize {
     } else {
         64 - c.unsigned_abs().leading_zeros() as usize
     }
+}
+
+/// The raw field of a non-zero centred coefficient in octave `b`: its mantissa below the leading
+/// bit, and the sign above it, `b` bits in all.
+fn cell_field(c: i64, b: usize) -> u64 {
+    let magnitude = c.unsigned_abs();
+    (magnitude - (1 << (b - 1))) | ((c < 0) as u64) << (b - 1)
+}
+
+/// The residue mod `q` of the coefficient [`cell_field`] coded, or `Malformed` past `q/2`.
+fn cell_residue(b: usize, field: u64, q: u64) -> Result<u64, WireError> {
+    let magnitude = (1u64 << (b - 1)) | (field & ((1u64 << (b - 1)) - 1));
+    if magnitude > q / 2 {
+        return Err(WireError::Malformed);
+    }
+    Ok(if field >> (b - 1) != 0 {
+        q - magnitude
+    } else {
+        magnitude
+    })
 }
 
 // =================================================================================================
@@ -682,7 +708,7 @@ impl Encoder {
             if !model.coded {
                 raw.put_wide(
                     if *c < 0 {
-                        (MOD_Q as i64 + *c) as u64
+                        MOD_Q - c.unsigned_abs()
                     } else {
                         *c as u64
                     },
@@ -693,9 +719,7 @@ impl Encoder {
             let b = octave(*c);
             symbols.push((b, *role));
             if b > 0 {
-                let magnitude = c.unsigned_abs();
-                let field = (magnitude - (1 << (b - 1))) | ((*c < 0) as u64) << (b - 1);
-                raw.put_wide(field, b as u32);
+                raw.put_wide(cell_field(*c, b), b as u32);
             }
         }
 
@@ -755,15 +779,7 @@ impl<'a> Body<'a> {
                 continue;
             }
             let field = self.raw.get_wide(b as u32)?;
-            let magnitude = (1u64 << (b - 1)) | (field & ((1u64 << (b - 1)) - 1));
-            if magnitude > MOD_Q / 2 {
-                return Err(WireError::Malformed);
-            }
-            *slot = if field >> (b - 1) != 0 {
-                MOD_Q - magnitude
-            } else {
-                magnitude
-            };
+            *slot = cell_residue(b, field, MOD_Q)?;
         }
         self.index = index;
         Ok(())
@@ -1027,6 +1043,7 @@ fn representation(tag: u64) -> Result<Representation, WireError> {
     })
 }
 
+#[cfg(not(rokoko_family = "trinomial"))]
 pub fn initial_to_bytes(proof: &ClaimsProof) -> Vec<u8> {
     let mut encoder = Encoder::new();
     encoder.polys(&proof.polys);
@@ -1035,6 +1052,7 @@ pub fn initial_to_bytes(proof: &ClaimsProof) -> Vec<u8> {
     encoder.finish()
 }
 
+#[cfg(not(rokoko_family = "trinomial"))]
 pub fn initial_from_bytes(bytes: &[u8]) -> Result<ClaimsProof, WireError> {
     let mut decoder = Decoder::new(bytes)?;
     Ok(ClaimsProof {
@@ -1206,5 +1224,50 @@ mod tests {
         let bytes = to_bytes(&sumcheck(None, false));
         assert!(from_bytes(&bytes[..bytes.len() - 8]).is_err());
         assert!(from_bytes(&bytes[..12]).is_err());
+    }
+
+    /// Centred residues of the Goldilocks prime reach `2^63` in magnitude: their octaves fit the
+    /// 64 symbols a wide `q` gets, and their raw fields and residues survive the bit streams.
+    #[test]
+    fn cells_roundtrip_at_goldilocks() {
+        const P: u64 = incomplete_rexl::GOLDILOCKS_P;
+        let centred = |v: u64| match v > P / 2 {
+            true => -((P - v) as i64),
+            false => v as i64,
+        };
+        let residues = [
+            1,
+            2,
+            P / 2,
+            P / 2 + 1,
+            P - 1,
+            P - 2,
+            1 << 32,
+            P - (1 << 32),
+            1 << 62,
+            P - (1 << 62),
+            0x1234_5678_9abc_def0,
+        ];
+        let mut writer = BitWriter::with_capacity(256);
+        for &v in &residues {
+            let c = centred(v);
+            let b = octave(c);
+            assert!((1..64).contains(&b), "octave {b} of {c}");
+            writer.put_wide(cell_field(c, b), b as u32);
+            writer.put_wide(v, 64);
+        }
+        let bytes = writer.finish();
+        let mut reader = BitReader::new(&bytes);
+        for &v in &residues {
+            let b = octave(centred(v));
+            let field = reader.get_wide(b as u32).unwrap();
+            assert_eq!(cell_residue(b, field, P), Ok(v));
+            assert_eq!(reader.get_wide(64), Ok(v));
+        }
+        // An octave-63 magnitude past p/2 is no residue.
+        assert_eq!(
+            cell_residue(63, (1 << 62) - 1, P),
+            Err(WireError::Malformed)
+        );
     }
 }

@@ -22,6 +22,30 @@ impl Default for HashWrapper {
 }
 
 static SEED: &[u8] = b"Smutno mi, Boze";
+
+/// `2^64 - (2^64 mod q)`, the largest multiple of an odd `q > 1` that a `u64` draw can stay below.
+/// A draw at or past it is rejected, and an accepted one reduces to a uniform residue. For
+/// Goldilocks this is `p` itself (rejection `2^-32`). Below `2^50` the rejection rate is below
+/// `2^-14` (`2^-38.6` for the default ring) and every accepted draw reduces exactly as the plain
+/// `x mod q` did, so the transcripts of the existing rings only change on a rejection.
+pub const fn rejection_bound(q: u64) -> u64 {
+    0u64.wrapping_sub((u64::MAX % q + 1) % q)
+}
+
+const SAMPLE_BOUND: u64 = rejection_bound(MOD_Q);
+const _: () = assert!(MOD_Q % 2 == 1 && MOD_Q > 1);
+
+/// Replaces every word of `words` at or past [`rejection_bound`]`(q)` by the next accepted word of
+/// `next`, in order: uniform words in, uniform words below a multiple of `q` out.
+pub fn reject_past_bound(words: &mut [u64], q: u64, mut next: impl FnMut() -> u64) {
+    let bound = rejection_bound(q);
+    for word in words.iter_mut() {
+        while *word >= bound {
+            *word = next();
+        }
+    }
+}
+
 impl HashWrapper {
     #[cfg(feature = "debug-fs")]
     fn dbg_fs(&self, tag: &str, n: usize) {
@@ -101,19 +125,45 @@ impl HashWrapper {
         u64::from_le_bytes(buf)
     }
 
+    /// A uniform residue: [`Self::sample_u64`] until a draw lands below [`rejection_bound`].
     pub fn sample_u64_mod_q(&mut self) -> u64 {
         self.dbg_fs("sample_u64_mod_q", 1);
-        self.sample_u64() % MOD_Q
+        loop {
+            let x = self.sample_u64();
+            if x < SAMPLE_BOUND {
+                return x % MOD_Q;
+            }
+        }
     }
 
     pub fn fill_from_xof(&mut self, label: &[u8], out: &mut [u8]) {
+        self.xof(label).fill(out);
+    }
+
+    fn xof(&mut self, label: &[u8]) -> blake3::OutputReader {
         let mut state = self.transcript.clone();
         state.update(&self.sample_counter.to_le_bytes());
         state.update(label);
         self.sample_counter += 1;
 
-        let mut xof = state.finalize_xof();
-        xof.fill(out);
+        state.finalize_xof()
+    }
+
+    /// Uniform residues mod q into `out`, from one XOF stream: the words are read in order (native
+    /// endianness), and a word past [`rejection_bound`] is replaced by the next word of the same
+    /// stream, so without rejections the output is the plain reduction of the first `out.len()`
+    /// words.
+    fn fill_residues_from_xof(&mut self, label: &[u8], out: &mut [u64]) {
+        let mut xof = self.xof(label);
+        xof.fill(unsafe {
+            std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, std::mem::size_of_val(out))
+        });
+        reject_past_bound(out, MOD_Q, || {
+            let mut word = [0u8; 8];
+            xof.fill(&mut word);
+            u64::from_ne_bytes(word)
+        });
+        unsafe { eltwise_reduce_mod(out.as_mut_ptr(), out.as_mut_ptr(), out.len() as u64, MOD_Q) };
     }
 
     #[allow(dead_code)]
@@ -159,36 +209,12 @@ impl HashWrapper {
 
     pub fn sample_ring_element_into(&mut self, output: &mut RingElement) {
         self.dbg_fs("sample_ring_element_into", 1);
-        let buf = output.v.as_mut_ptr() as *mut u8;
-        let len = output.v.len() * std::mem::size_of::<u64>();
-        self.fill_from_xof(b"ring-element", unsafe {
-            std::slice::from_raw_parts_mut(buf, len)
-        });
-        unsafe {
-            eltwise_reduce_mod(
-                output.v.as_mut_ptr(),
-                output.v.as_mut_ptr(),
-                output.v.len() as u64,
-                MOD_Q,
-            );
-        }
+        self.fill_residues_from_xof(b"ring-element", &mut output.v);
     }
 
     pub fn sample_field_element_into(&mut self, output: &mut FieldExtension) {
         self.dbg_fs("sample_field_element_into", 1);
-        let buf = output.coeffs.as_mut_ptr() as *mut u8;
-        let len = output.coeffs.len() * std::mem::size_of::<u64>();
-        self.fill_from_xof(b"field-element", unsafe {
-            std::slice::from_raw_parts_mut(buf, len)
-        });
-        unsafe {
-            eltwise_reduce_mod(
-                output.coeffs.as_mut_ptr(),
-                output.coeffs.as_mut_ptr(),
-                output.coeffs.len() as u64,
-                MOD_Q,
-            );
-        }
+        self.fill_residues_from_xof(b"field-element", &mut output.coeffs);
     }
     pub fn sample_ring_element_vec_into(&mut self, output: &mut [RingElement]) {
         self.dbg_fs("sample_ring_element_vec_into", output.len());
@@ -386,5 +412,58 @@ mod tests {
             }
         }
         debug_assert!(found_nonzero);
+    }
+
+    #[test]
+    fn rejection_bound_is_the_largest_multiple_of_q() {
+        const P: u64 = incomplete_rexl::GOLDILOCKS_P;
+        assert_eq!(rejection_bound(P), P);
+        for q in [MOD_Q, 3, (1 << 63) - 25, u64::MAX - 58, P] {
+            let bound = rejection_bound(q) as u128;
+            assert_eq!(bound % q as u128, 0);
+            assert!((1u128 << 64) - bound < q as u128);
+        }
+    }
+
+    #[test]
+    fn rejected_words_are_replaced_in_order() {
+        const P: u64 = incomplete_rexl::GOLDILOCKS_P;
+        let mut words = [0, P - 1, P, u64::MAX, 5, P + 7];
+        let mut stream = [u64::MAX, 11, P, 12, 13].into_iter();
+        reject_past_bound(&mut words, P, || stream.next().unwrap());
+        assert_eq!(words, [0, P - 1, 11, 12, 5, 13]);
+
+        // A modulus whose bound lies past it: `MOD_Q`, unless it is `P`, whose bound is `P`.
+        let q = if MOD_Q == P { (1 << 50) - 2687 } else { MOD_Q };
+        let bound = rejection_bound(q);
+        let mut words = [0, q, bound - 1, bound, u64::MAX];
+        let mut stream = [bound + 1, 7, 8].into_iter();
+        reject_past_bound(&mut words, q, || stream.next().unwrap());
+        assert_eq!(words, [0, q, bound - 1, 7, 8]);
+    }
+
+    /// Below the bound, uniform sampling is the plain reduction of the XOF words it always was.
+    #[test]
+    fn accepted_ring_samples_are_the_plain_reduction() {
+        let bound = rejection_bound(MOD_Q);
+        let mut checked = 0;
+        for seed in 0..16u64 {
+            let mut transcript = HashWrapper::new();
+            transcript.update_with_u64(seed);
+            let mut plain = transcript.clone();
+            let mut words = [0u64; DEGREE];
+            plain.fill_from_xof(b"ring-element", unsafe {
+                std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, 8 * DEGREE)
+            });
+            let mut element = RingElement::new(Representation::IncompleteNTT);
+            transcript.sample_ring_element_into(&mut element);
+            assert!(element.v.iter().all(|&c| c < MOD_Q));
+            if words.iter().all(|&w| w < bound) {
+                assert!(element.v.iter().zip(&words).all(|(&c, &w)| c == w % MOD_Q));
+                checked += 1;
+            }
+            assert_eq!(transcript.sample_u64(), plain.sample_u64());
+        }
+        assert!(checked > 0);
     }
 }

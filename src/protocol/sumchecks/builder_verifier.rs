@@ -1,6 +1,6 @@
 use crate::{
     common::{
-        arithmetic::{ONE, ONE_FE},
+        arithmetic::{pow_mod, ONE, ONE_FE},
         config::{DEGREE, NOF_BATCHES},
         ring_arithmetic::{FieldExtension, Representation, RingElement},
         structured_row::StructuredRow,
@@ -204,8 +204,10 @@ pub fn load_combiner_evaluation_data(
 ) -> ElephantCell<BasicEvaluationLinearSumcheck<RingElement>> {
     let data = (0..chunks)
         .map(|i| {
+            // Reduced mod q, as on the prover side (`composition_sumcheck`): an unreduced shift
+            // wraps once `base_log * i >= log2 q`.
             RingElement::constant(
-                1u64 << (base_log as u64 * i as u64),
+                pow_mod(2, base_log * i as u64),
                 Representation::IncompleteNTT,
             )
         })

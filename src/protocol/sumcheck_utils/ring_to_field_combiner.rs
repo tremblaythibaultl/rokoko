@@ -222,7 +222,7 @@ impl EvaluationSumcheckData for RingToFieldCombinerEvaluation {
 mod tests {
     use super::*;
 
-    /// The first `SLOT_DEGREE` of `coeffs`.
+    /// The first `SLOT_DEGREE` of `coeffs`, for any slot degree up to 4.
     fn field_element(coeffs: [u64; 4]) -> FieldExtension {
         FieldExtension {
             coeffs: std::array::from_fn(|k| coeffs[k]),

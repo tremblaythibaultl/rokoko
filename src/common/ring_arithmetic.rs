@@ -230,8 +230,10 @@ impl RingElement {
             "Not in Incomplete NTT representation"
         );
 
-        if SLOT_DEGREE == 4 {
-            self.swap_inverted_slots();
+        match SLOT_DEGREE {
+            2 => {}
+            3 | 4 => self.swap_inverted_slots(),
+            _ => unreachable!("slot degree {SLOT_DEGREE}"),
         }
         unsafe {
             eltwise_mult_mod(
@@ -260,16 +262,20 @@ impl RingElement {
                 MOD_Q,
             );
         }
-        if SLOT_DEGREE == 4 {
-            self.swap_inverted_slots();
+        match SLOT_DEGREE {
+            2 => {}
+            3 | 4 => self.swap_inverted_slots(),
+            _ => unreachable!("slot degree {SLOT_DEGREE}"),
         }
         self.representation = Representation::IncompleteNTT;
     }
 
-    /// Parts 1 and 3 of the slots whose homogenization inverts `X` trade places.
+    /// Parts 1 and `D - 1` (3 for degree 4, 2 for degree 3) of the slots whose homogenization
+    /// inverts `X` trade places.
     fn swap_inverted_slots(&mut self) {
         for &slot in INVERTED_SLOTS.iter() {
-            self.v.swap(NUM_SLOTS + slot, 3 * NUM_SLOTS + slot);
+            self.v
+                .swap(NUM_SLOTS + slot, (SLOT_DEGREE - 1) * NUM_SLOTS + slot);
         }
     }
 
@@ -371,22 +377,20 @@ impl RingElement {
     }
 
     fn conjugate_in_place_ref(&mut self) {
-        // True Galois conjugation: X -> X^{-1} = -X^{n-1} in Z_q[X]/(X^n + 1)
-        // In coefficient form: [c_0, c_1, ..., c_{n-1}] -> [c_0, -c_{n-1}, -c_{n-2}, ..., -c_1]
+        // True Galois conjugation X -> X^{-1}, in coefficient space.
         // Reference implementation used for deriving NTT-domain transformations
         debug_assert_eq!(self.representation, Representation::IncompleteNTT);
         self.from_incomplete_ntt_to_strided_coefficients();
         self.from_strided_coefficients_to_coefficients();
-
-        // Reverse and negate coefficients 1 to n-1
-        for i in 1..(DEGREE / 2 + 1) {
-            let temp = self.v[i];
-            self.v[i] = MOD_Q - self.v[DEGREE - i];
-            self.v[DEGREE - i] = MOD_Q - temp;
-        }
-
+        conjugate_coefficients(&mut self.v);
         self.from_coefficients_to_strided_coefficients();
         self.from_strided_coefficients_to_incomplete_ntt_representation();
+    }
+
+    /// [`Self::conjugate_in_place_ref`] of a Coefficients element, for tests and references.
+    pub fn conjugate_coefficients_ref(&mut self) {
+        debug_assert_eq!(self.representation, Representation::Coefficients);
+        conjugate_coefficients(&mut self.v);
     }
 
     #[inline]
@@ -396,7 +400,8 @@ impl RingElement {
     }
 
     pub fn conjugate_in_place(&mut self) {
-        // True Galois conjugation: X -> X^{-1} = -X^{n-1} in Z_q[X]/(X^n + 1)
+        // True Galois conjugation: X -> X^{-1}, which is -X^{N-1} in Z_q[X]/(X^N + 1) and
+        // X^{n-1} - X^{2n-1} in Z_p[X]/(X^{2n} - X^n + 1)
         // Pure NTT-domain implementation using empirically derived transformations
         //
         // PERFORMANCE: O(n) vs O(n log n)
@@ -405,12 +410,14 @@ impl RingElement {
         //
         // MATHEMATICAL FOUNDATION:
         // =======================
-        // Conjugation in coefficient space: [c_0, c_1, ..., c_{n-1}] -> [c_0, -c_{n-1}, ..., -c_1]
-        // This reverses and negates all non-constant coefficients.
+        // Conjugation in coefficient space for X^N + 1: [c_0, c_1, ..., c_{N-1}] ->
+        // [c_0, -c_{N-1}, ..., -c_1], which reverses and negates all non-constant coefficients.
+        // For X^{2n} - X^n + 1 each X^{-t} is a signed sum of at most two monomials
+        // (`conjugate_coefficients`).
         //
         // In slot j, X^{-1} = zeta_j^{-1} X^{D-1}, so the slot takes its value from the slot i
         // with zeta_i = zeta_j^{-1}, and part r of slot i lands in part (D - r) mod D of slot j,
-        // scaled by a power of zeta_j.
+        // scaled by a power of zeta_j. This holds in both families: it only uses X^D = zeta_j.
         //
         // NTT-DOMAIN TRANSFORMATION:
         // =========================
@@ -467,8 +474,11 @@ impl RingElement {
             self.representation,
             Representation::HomogenizedFieldExtensions
         );
-        if SLOT_DEGREE == 4 {
-            return self.inverse_degree4();
+        match SLOT_DEGREE {
+            2 => {}
+            3 => return self.inverse_degree3(),
+            4 => return self.inverse_degree4(),
+            _ => unreachable!("slot degree {SLOT_DEGREE}"),
         }
 
         // Each slot is Z_q[X]/(X^2 - beta) where beta = FIELD_SHIFT_FACTOR.
@@ -565,6 +575,49 @@ impl RingElement {
         result
     }
 
+    /// Slot by slot in `Z_p[Y]/(Y^3 - alpha)`: `a^{-1} = b / N(a)` with `b` the adjugate,
+    /// `b = (a0^2 - alpha a1 a2, alpha a2^2 - a0 a1, a1^2 - a0 a2)`, for which `a b` is the base
+    /// field element `N(a) = a0 b0 + alpha (a1 b2 + a2 b1)`. The norms are inverted in one batch.
+    fn inverse_degree3(&self) -> RingElement {
+        use incomplete_rexl::goldilocks::{add, mul, sub};
+        let alpha = *FIELD_SHIFT_FACTOR;
+        let part = |r: usize, i: usize| self.v[r * NUM_SLOTS + i];
+
+        let mut adjugates = [[0u64; 3]; NUM_SLOTS];
+        let mut norms = [0u64; NUM_SLOTS];
+        for i in 0..NUM_SLOTS {
+            let (a0, a1, a2) = (part(0, i), part(1, i), part(2, i));
+            let b = [
+                sub(mul(a0, a0), mul(alpha, mul(a1, a2))),
+                sub(mul(alpha, mul(a2, a2)), mul(a0, a1)),
+                sub(mul(a1, a1), mul(a0, a2)),
+            ];
+            norms[i] = add(mul(a0, b[0]), mul(alpha, add(mul(a1, b[2]), mul(a2, b[1]))));
+            adjugates[i] = b;
+        }
+
+        let mut prefix_products = [0u64; NUM_SLOTS];
+        prefix_products[0] = norms[0];
+        for i in 1..NUM_SLOTS {
+            prefix_products[i] = mul(prefix_products[i - 1], norms[i]);
+        }
+        let mut inv = incomplete_rexl::goldilocks::inv(prefix_products[NUM_SLOTS - 1]);
+        let mut inverses = [0u64; NUM_SLOTS];
+        for i in (1..NUM_SLOTS).rev() {
+            inverses[i] = mul(inv, prefix_products[i - 1]);
+            inv = mul(inv, norms[i]);
+        }
+        inverses[0] = inv;
+
+        let mut result = RingElement::new(Representation::HomogenizedFieldExtensions);
+        for i in 0..NUM_SLOTS {
+            for (r, &b) in adjugates[i].iter().enumerate() {
+                result.v[r * NUM_SLOTS + i] = mul(b, inverses[i]);
+            }
+        }
+        result
+    }
+
     /// Slot by slot in `Z_q[Y]/(Y^4 - alpha)` through the tower `Z = Y^2`: for
     /// `a = A0 + Y A1`, `A0 = a0 + a2 Z`, `A1 = a1 + a3 Z`, the norm to `Z_q[Z]/(Z^2 - alpha)` is
     /// `n = A0^2 - Z A1^2 = n0 + n1 Z`, and `a^{-1} = (A0 - Y A1)(n0 - n1 Z) / (n0^2 - alpha n1^2)`.
@@ -619,7 +672,16 @@ impl RingElement {
         result
     }
 
-    pub fn constant_term_from_incomplete_ntt(&self) -> u64 {
+    /// `Tr(x) / DEGREE` of an IncompleteNTT element, the trace of `K/Q` (reduced mod `q`) over the
+    /// degree, computed as the mean over the slots of part 0, `x_0(zeta_i)`.
+    ///
+    /// - For `X^N + 1` (`RingFamily::PowerOfTwo`) this is the constant term `x_0`: the trace of
+    ///   `X^t` vanishes for `0 < t < N`.
+    /// - For `X^{2n} - X^n + 1` (`RingFamily::Trinomial`) it is NOT the constant term but
+    ///   `x_0 + x_n / 2` (the note, Corollary 4.3): the trace of `X^{+-n}` is `phi / 2`. The constant
+    ///   term and `Tr/phi` agree on elements `x conj(x)` (Corollary 4.4), which is what the norm
+    ///   checks need.
+    pub fn trace_over_degree(&self) -> u64 {
         debug_assert_eq!(self.representation, Representation::IncompleteNTT);
         let mut buf = [0u64; DEGREE];
         buf.copy_from_slice(&self.v);
@@ -632,13 +694,14 @@ impl RingElement {
                 MOD_Q,
             );
         }
-        let mut sum = 0u64;
+        // `NUM_SLOTS` residues: their sum leaves the `u64` once `q` is wide.
+        let mut sum = 0u128;
         for i in 0..NUM_SLOTS {
-            sum += buf[i];
+            sum += buf[i] as u128;
         }
 
         // we call it once so it's probably fine
-        sum % MOD_Q
+        (sum % MOD_Q as u128) as u64
     }
 }
 
@@ -653,15 +716,29 @@ pub static CONSTANT_TERM_FACTORS: LazyLock<[u64; NUM_SLOTS]> = LazyLock::new(|| 
     factors.v[..NUM_SLOTS].try_into().unwrap()
 });
 
-pub static SHIFT_FACTORS: LazyLock<[u64; NUM_SLOTS]> = LazyLock::new(|| {
-    let mut factors = [0u64; NUM_SLOTS];
-    factors[1] = 1;
-    unsafe { ntt_forward_in_place(factors.as_mut_ptr(), factors.len(), MOD_Q) };
-    factors
+/// `zeta_i`, the root of slot `i`: slot `i` of an IncompleteNTT element is its residue modulo
+/// `X^D - zeta_i`, so `zeta_i` is slot `i` of `Y = X^D`.
+pub static SHIFT_FACTORS: LazyLock<[u64; NUM_SLOTS]> = LazyLock::new(|| match RING_FAMILY {
+    // The length-N/D negacyclic NTT of `Y`, which is part 0 of the slot transform.
+    RingFamily::PowerOfTwo => {
+        let mut factors = [0u64; NUM_SLOTS];
+        factors[1] = 1;
+        unsafe { ntt_forward_in_place(factors.as_mut_ptr(), factors.len(), MOD_Q) };
+        factors
+    }
+    // `eta_i`, part 0 of the trinomial slot transform of `Y`.
+    RingFamily::Trinomial => {
+        let mut y = [0u64; DEGREE];
+        y[1] = 1;
+        SLOT_RING.ntt_forward(&mut y);
+        y[..NUM_SLOTS].try_into().unwrap()
+    }
 });
 
 pub static FIELD_SHIFT_FACTOR: LazyLock<u64> = LazyLock::new(|| SHIFT_FACTORS[0]);
 
+/// `HALF_DEGREE^{-1}` and its double; unused by the ring layer, and meaningless for the
+/// trinomial family.
 pub static INV_HALF_DEGREE: LazyLock<u64> =
     LazyLock::new(|| unsafe { power_mod(HALF_DEGREE as u64, MOD_Q - 2, MOD_Q) });
 
@@ -740,7 +817,7 @@ fn derive_conjugation_transform() -> ConjugationTransform {
             conjugated.conjugate_in_place_ref();
 
             // The value lands in one slot of the mirrored part, and since we started with 1
-            // the value there is the factor.
+            // the value there is the factor. Both families: X^{-1} = zeta_j^{-1} X^{D-1} in slot j.
             let j = (0..NUM_SLOTS)
                 .find(|&j| conjugated.v[target + j] != 0)
                 .expect("conjugation maps part r into part (D - r) mod D");
@@ -873,7 +950,13 @@ pub fn incomplete_ntt_multiplication_in_place(result: &mut RingElement, operand:
     }
 }
 
-static SLOT_RING: LazyLock<SlotRing> = LazyLock::new(|| SlotRing::new(DEGREE, MOD_Q));
+/// The slot transform and product of the ring's family, chosen at compile time.
+#[cfg(not(rokoko_family = "trinomial"))]
+type FamilySlotRing = SlotRing;
+#[cfg(rokoko_family = "trinomial")]
+type FamilySlotRing = TrinomialSlotRing;
+
+static SLOT_RING: LazyLock<FamilySlotRing> = LazyLock::new(|| FamilySlotRing::new(DEGREE, MOD_Q));
 
 /// Slot-wise product modulo `X^D - zeta_i` of two IncompleteNTT elements.
 #[inline(always)]
@@ -987,12 +1070,16 @@ pub fn incomplete_ntt_multiplication_inner(
         return;
     }
 
-    if SLOT_DEGREE == 4 {
-        let a = operand1.split_into_field_extensions();
-        let b = operand2.split_into_field_extensions();
-        let product: [FieldExtension; NUM_SLOTS] = std::array::from_fn(|i| a[i] * b[i]);
-        result.combine_from_field_extensions(&product);
-        return;
+    match SLOT_DEGREE {
+        2 => {}
+        3 | 4 => {
+            let a = operand1.split_into_field_extensions();
+            let b = operand2.split_into_field_extensions();
+            let product: [FieldExtension; NUM_SLOTS] = std::array::from_fn(|i| a[i] * b[i]);
+            result.combine_from_field_extensions(&product);
+            return;
+        }
+        _ => unreachable!("slot degree {SLOT_DEGREE}"),
     }
 
     // Homogenized path: keep original separate-call implementation
@@ -1074,6 +1161,10 @@ pub fn naive_polynomial_multiplication(
         "Result not in Coefficients representation"
     );
 
+    if RING_FAMILY == RingFamily::Trinomial {
+        return naive_trinomial_multiplication(result, operand1, operand2);
+    }
+
     for i in 0..DEGREE {
         result.v[i] = 0;
     }
@@ -1085,12 +1176,91 @@ pub fn naive_polynomial_multiplication(
             if i + j >= DEGREE {
                 // Negation in modular arithmetic: MOD_Q - value
                 let neg_prod = (MOD_Q as u128 - prod) % (MOD_Q as u128);
-                result.v[index] = (result.v[index] + neg_prod as u64) % MOD_Q;
+                result.v[index] = ((result.v[index] as u128 + neg_prod) % MOD_Q as u128) as u64;
             } else {
-                result.v[index] = (result.v[index] + prod as u64) % MOD_Q;
+                result.v[index] = ((result.v[index] as u128 + prod) % MOD_Q as u128) as u64;
             }
         }
     }
+}
+
+/// [`naive_polynomial_multiplication`] modulo `X^{2n} - X^n + 1`, `n = HALF_DEGREE`: the
+/// schoolbook product of degree below `4n`, then `X^t = X^{t-n} - X^{t-2n}` (`X^{2n} = X^n - 1`)
+/// from the top down.
+fn naive_trinomial_multiplication(
+    result: &mut RingElement,
+    operand1: &RingElement,
+    operand2: &RingElement,
+) {
+    let (q, n) = (MOD_Q as u128, HALF_DEGREE);
+    let mut wide = vec![0u128; 2 * DEGREE];
+    for i in 0..DEGREE {
+        for j in 0..DEGREE {
+            let prod = (operand1.v[i] as u128 * operand2.v[j] as u128) % q;
+            wide[i + j] = (wide[i + j] + prod) % q;
+        }
+    }
+    for t in (DEGREE..2 * DEGREE).rev() {
+        let c = wide[t];
+        wide[t - n] = (wide[t - n] + c) % q;
+        wide[t - 2 * n] = (wide[t - 2 * n] + q - c) % q;
+    }
+    for i in 0..DEGREE {
+        result.v[i] = wide[i] as u64;
+    }
+}
+
+/// `x(X^{-1})` of the coefficients `x`, reduced mod `q`.
+///
+/// - `X^N + 1`: `X^{-t} = -X^{N-t}`, which reverses and negates `x_1, ..., x_{N-1}`.
+/// - `X^{2n} - X^n + 1`: `X^{3n} = -1` gives the note's eq. (1), `X^{-t} = -X^{3n-t}` for
+///   `n < t < 2n`, `1 - X^n` for `t = n` and `X^{n-t} - X^{2n-t}` for `0 < t < n`.
+fn conjugate_coefficients(v: &mut [u64; DEGREE]) {
+    match RING_FAMILY {
+        RingFamily::PowerOfTwo => {
+            // Reverse and negate coefficients 1 to n-1
+            for i in 1..(DEGREE / 2 + 1) {
+                // `(q - c) mod q`, not `q - c`: a residue equal to `q` would reach the NTT, and the
+                // wide-modulus kernels give no lazy-reduction slack.
+                let temp = v[i];
+                v[i] = (MOD_Q - v[DEGREE - i]) % MOD_Q;
+                v[DEGREE - i] = (MOD_Q - temp) % MOD_Q;
+            }
+        }
+        RingFamily::Trinomial => {
+            let n = HALF_DEGREE;
+            let mut out = [0u64; DEGREE];
+            out[0] = v[0] % MOD_Q;
+            let add = |x: &mut u64, c: u64| *x = unsafe { add_mod(*x, c, MOD_Q) };
+            let sub = |x: &mut u64, c: u64| *x = unsafe { sub_mod(*x, c, MOD_Q) };
+            for t in 1..DEGREE {
+                let c = v[t];
+                if t > n {
+                    sub(&mut out[3 * n - t], c);
+                } else if t == n {
+                    add(&mut out[0], c);
+                    sub(&mut out[n], c);
+                } else {
+                    add(&mut out[n - t], c);
+                    sub(&mut out[2 * n - t], c);
+                }
+            }
+            *v = out;
+        }
+    }
+}
+
+/// `tau = X^{h} + X^{2h} - X^{4h}`, `h = NUM_SLOTS / 2 = 2^{k-1}`, in Coefficients form: the
+/// generator of the subfield `Z_p[tau] = F_{p^3}` of the trinomial ring, with
+/// `tau^3 - 3 tau + 1 = 0` (the note, Proposition 3.4). Trinomial family only.
+pub fn subfield_generator() -> RingElement {
+    assert_eq!(RING_FAMILY, RingFamily::Trinomial);
+    let h = NUM_SLOTS / 2;
+    let mut tau = RingElement::new(Representation::Coefficients);
+    for (e, c) in [(h, 1), (2 * h, 1), (4 * h, MOD_Q - 1)] {
+        tau.v[e] = c;
+    }
+    tau
 }
 
 pub static NORMALIZE_INCOMPLETE_NTT_FACTORS: LazyLock<[u64; DEGREE - NUM_SLOTS]> =
@@ -1099,10 +1269,13 @@ pub static NORMALIZE_INCOMPLETE_NTT_FACTORS: LazyLock<[u64; DEGREE - NUM_SLOTS]>
 pub static NORMALIZE_INCOMPLETE_NTT_FACTORS_INVERSE: LazyLock<[u64; DEGREE - NUM_SLOTS]> =
     LazyLock::new(|| get_roots_of_unity_trans().1);
 
-/// Slots whose homogenization sends `Y` to a multiple of `X^{-1}`; only degree-4 slots have them.
+/// Slots whose homogenization sends `Y` to a multiple of `X^{-1}`; only degree-3 and degree-4
+/// slots have them.
 pub static INVERTED_SLOTS: LazyLock<Vec<usize>> = LazyLock::new(|| match SLOT_DEGREE {
+    2 => Vec::new(),
+    3 => degree3_homogenization().1,
     4 => degree4_homogenization().1,
-    _ => Vec::new(),
+    _ => unreachable!("slot degree {SLOT_DEGREE}"),
 });
 
 /// Factors of parts `1..D`, part by part, taking slot `i` of an IncompleteNTT element to
@@ -1110,7 +1283,9 @@ pub static INVERTED_SLOTS: LazyLock<Vec<usize>> = LazyLock::new(|| match SLOT_DE
 pub fn get_roots_of_unity_trans() -> ([u64; DEGREE - NUM_SLOTS], [u64; DEGREE - NUM_SLOTS]) {
     let roots_translations = match SLOT_DEGREE {
         2 => degree2_homogenization(),
-        _ => degree4_homogenization().0,
+        3 => degree3_homogenization().0,
+        4 => degree4_homogenization().0,
+        _ => unreachable!("slot degree {SLOT_DEGREE}"),
     };
 
     let mut roots_translations_inv = [0u64; DEGREE - NUM_SLOTS];
@@ -1144,6 +1319,70 @@ fn degree2_homogenization() -> [u64; DEGREE - NUM_SLOTS] {
         roots_translations[i] = unsafe { power_mod(SHIFT_FACTORS[i], t, MOD_Q) };
     }
     roots_translations
+}
+
+/// Degree-3 slots of the trinomial family. `alpha = zeta_0`
+/// has order `3 * NUM_SLOTS` and generates the primitive `3 * NUM_SLOTS`-th roots of unity, so
+/// `zeta_i = alpha^{e_i}` with `e_i` prime to 6; `zeta_i / alpha` is a cube iff `e_i = 1 mod 3`.
+///
+/// - If `e_i = 1 mod 3`, `X -> c Y` with `c^3 = zeta_i / alpha` scales part `r` by `c^r`.
+/// - If `e_i = 2 mod 3`, `zeta_i alpha` is a cube and `X -> d Y^{-1} = d Y^2 / alpha` with
+///   `d^3 = zeta_i alpha` swaps parts 1 and 2 and then scales part 1 by `d^2 / alpha` and part 2 by
+///   `d / alpha`.
+///
+/// Of the three cube roots, which differ by the Frobenius `Y -> Y alpha^{(p-1)/3}`, exactly one
+/// sends the image of `tau = X^{h} + X^{2h} - X^{4h}` to its image in slot 0, where the map is the
+/// identity. Every slot then sends `tau` to the same `T`, so the diagonal (one FieldExtension in
+/// every homogenized slot) is the subfield `Z_p[tau]`, which conjugation fixes pointwise.
+fn degree3_homogenization() -> ([u64; DEGREE - NUM_SLOTS], Vec<usize>) {
+    let order = 3 * NUM_SLOTS;
+    let mut powers = vec![1u64; order];
+    for k in 1..order {
+        powers[k] = unsafe { multiply_mod(powers[k - 1], SHIFT_FACTORS[0], MOD_Q) };
+    }
+    let power = |e: usize| powers[e % order];
+
+    let mut tau = subfield_generator();
+    tau.to_representation(Representation::IncompleteNTT);
+    let slot = |i: usize| [tau.v[i], tau.v[NUM_SLOTS + i], tau.v[2 * NUM_SLOTS + i]];
+    let target = slot(0);
+
+    let mut factors = [0u64; DEGREE - NUM_SLOTS];
+    let mut inverted = Vec::new();
+    for i in 0..NUM_SLOTS {
+        let e = powers
+            .iter()
+            .position(|&p| p == SHIFT_FACTORS[i])
+            .expect("every zeta_i is a power of zeta_0");
+        assert!(e % 2 == 1 && e % 3 != 0, "zeta_{i} is not primitive");
+        let swap = e % 3 == 2;
+        // The cube roots `alpha^{s + t NUM_SLOTS}`, `t < 3`, of `alpha^{e -+ 1}`; `alpha^{NUM_SLOTS}`
+        // is a primitive cube root of unity.
+        let base = if swap { (e + 1) / 3 } else { (e - 1) / 3 };
+        let [a0, a1, a2] = slot(i);
+        let candidates: Vec<[u64; 2]> = (0..3)
+            .map(|t| base + t * NUM_SLOTS)
+            .map(|s| match swap {
+                true => [power(2 * s + order - 1), power(s + order - 1)],
+                false => [power(s), power(2 * s)],
+            })
+            .filter(|f| {
+                let (p1, p2) = if swap { (a2, a1) } else { (a1, a2) };
+                let image = [a0, unsafe { multiply_mod(p1, f[0], MOD_Q) }, unsafe {
+                    multiply_mod(p2, f[1], MOD_Q)
+                }];
+                image == target
+            })
+            .collect();
+        assert_eq!(candidates.len(), 1, "slot {i}: one cube root aligns tau");
+        for r in 1..SLOT_DEGREE {
+            factors[(r - 1) * NUM_SLOTS + i] = candidates[0][r - 1];
+        }
+        if swap {
+            inverted.push(i);
+        }
+    }
+    (factors, inverted)
 }
 
 /// Degree-4 slots. `alpha = zeta_0` has order `2 * NUM_SLOTS` and generates the 2-Sylow subgroup
@@ -1282,7 +1521,7 @@ impl FieldExtension {
 }
 
 /// `x mod q` for `x < 2^(bits(q) + 61)`: Barrett with `floor(2^(64 + s) / q)`, `s = bits(q) - 2`,
-/// leaves the quotient at most one short.
+/// leaves the quotient at most one short. Only [`degree4_mul`]'s lazy path, `q < 2^50`, calls it.
 #[inline(always)]
 fn reduce_wide(x: u128) -> u64 {
     const S: u32 = 62 - MOD_Q.leading_zeros();
@@ -1299,9 +1538,13 @@ fn reduce_wide(x: u128) -> u64 {
 /// Product modulo `Y^4 - alpha` by two-level Karatsuba over the integers: `l`, `h`, `s` are the
 /// products of the low halves, high halves and half sums of `a = (a0 + a1 Y) + Y^2 (a2 + a3 Y)`,
 /// so every difference is a nonnegative sum of `a_i b_j` below `16 q^2`, reduced once per
-/// coefficient.
+/// coefficient. Both bounds need `q` well below `2^62`; a wider `q` reduces every product instead
+/// ([`slot_mul_mod`]).
 #[inline(always)]
 fn degree4_mul(a: &[u64; SLOT_DEGREE], b: &[u64; SLOT_DEGREE]) -> [u64; SLOT_DEGREE] {
+    if !crate::common::arithmetic::LAZY_REDUCTION {
+        return slot_mul_mod(a, b, *FIELD_SHIFT_FACTOR, MOD_Q);
+    }
     let product = |x: u64, y: u64| x as u128 * y as u128;
     let alpha = *FIELD_SHIFT_FACTOR as u128;
     let [a0, a1, a2, a3]: [u64; 4] = std::array::from_fn(|i| a[i]);
@@ -1320,6 +1563,36 @@ fn degree4_mul(a: &[u64; SLOT_DEGREE], b: &[u64; SLOT_DEGREE]) -> [u64; SLOT_DEG
     std::array::from_fn(|k| reduce_wide(low[k] + reduce_wide(high[k]) as u128 * alpha))
 }
 
+/// Product modulo `Y^3 - alpha`, `alpha = FIELD_SHIFT_FACTOR`, by Karatsuba over Goldilocks:
+/// degree-3 slots exist only in the trinomial family, whose modulus is `p`.
+#[inline(always)]
+fn degree3_mul(a: &[u64; SLOT_DEGREE], b: &[u64; SLOT_DEGREE]) -> [u64; SLOT_DEGREE] {
+    const { assert!(SLOT_DEGREE != 3 || MOD_Q == incomplete_rexl::GOLDILOCKS_P) };
+    let c = incomplete_rexl::trinomial::cubic_mul(
+        std::array::from_fn(|i| a[i]),
+        std::array::from_fn(|i| b[i]),
+        *FIELD_SHIFT_FACTOR,
+    );
+    std::array::from_fn(|k| c[k])
+}
+
+/// Schoolbook product modulo `Y^D - alpha` and `q`, reduced at every step: any `q < 2^64`.
+fn slot_mul_mod<const D: usize>(a: &[u64; D], b: &[u64; D], alpha: u64, q: u64) -> [u64; D] {
+    let (q, alpha) = (q as u128, alpha as u128);
+    let mut c = [0u128; D];
+    for i in 0..D {
+        for j in 0..D {
+            let term = a[i] as u128 * b[j] as u128 % q;
+            let (k, term) = match i + j < D {
+                true => (i + j, term),
+                false => (i + j - D, term * alpha % q),
+            };
+            c[k] = (c[k] + term) % q;
+        }
+    }
+    c.map(|c| c as u64)
+}
+
 impl Add for FieldExtension {
     type Output = Self;
 
@@ -1334,10 +1607,19 @@ impl Mul for FieldExtension {
     type Output = Self;
 
     fn mul(self, other: Self) -> Self {
-        if SLOT_DEGREE == 4 {
-            return Self {
-                coeffs: degree4_mul(&self.coeffs, &other.coeffs),
-            };
+        match SLOT_DEGREE {
+            2 => {}
+            3 => {
+                return Self {
+                    coeffs: degree3_mul(&self.coeffs, &other.coeffs),
+                }
+            }
+            4 => {
+                return Self {
+                    coeffs: degree4_mul(&self.coeffs, &other.coeffs),
+                }
+            }
+            _ => unreachable!("slot degree {SLOT_DEGREE}"),
         }
         let a = self.coeffs[0];
         let b = self.coeffs[1];
@@ -1400,9 +1682,17 @@ impl<'a> SubAssign<(&'a FieldExtension, &'a FieldExtension)> for FieldExtension 
 
 impl<'a> MulAssign<&'a FieldExtension> for FieldExtension {
     fn mul_assign(&mut self, other: &'a FieldExtension) {
-        if SLOT_DEGREE == 4 {
-            self.coeffs = degree4_mul(&self.coeffs, &other.coeffs);
-            return;
+        match SLOT_DEGREE {
+            2 => {}
+            3 => {
+                self.coeffs = degree3_mul(&self.coeffs, &other.coeffs);
+                return;
+            }
+            4 => {
+                self.coeffs = degree4_mul(&self.coeffs, &other.coeffs);
+                return;
+            }
+            _ => unreachable!("slot degree {SLOT_DEGREE}"),
         }
         let a = self.coeffs[0];
         let b = self.coeffs[1];
@@ -1480,6 +1770,7 @@ impl SizeableProof for FieldExtension {
 
 #[cfg(test)]
 mod tests {
+    use crate::common::arithmetic::{centered_i64_from_u64_mod_q_scalar, reduce_signed_wide};
     use crate::common::init_common;
     use rand::SeedableRng;
 
@@ -1670,6 +1961,56 @@ mod tests {
         assert_eq!(top * top, field_extension_schoolbook(&top, &top));
     }
 
+    /// [`slot_mul_mod`], the wide-modulus path of `degree4_mul`: it matches the product at `MOD_Q`
+    /// and, at the Goldilocks prime, is a commutative, associative and distributive product with
+    /// `Y^D = alpha`.
+    #[test]
+    fn slot_mul_mod_is_the_slot_product_at_any_modulus() {
+        init_common();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+        for _ in 0..200 {
+            let a = FieldExtension {
+                coeffs: std::array::from_fn(|_| rng.random_range(0..MOD_Q)),
+            };
+            let b = FieldExtension {
+                coeffs: std::array::from_fn(|_| rng.random_range(0..MOD_Q)),
+            };
+            assert_eq!(
+                slot_mul_mod(&a.coeffs, &b.coeffs, *FIELD_SHIFT_FACTOR, MOD_Q),
+                (a * b).coeffs
+            );
+        }
+
+        const P: u64 = incomplete_rexl::GOLDILOCKS_P;
+        fn check<const D: usize>(rng: &mut rand::rngs::StdRng) {
+            let alpha = rng.random_range(2..P);
+            let monomial = |k: usize| std::array::from_fn::<u64, D, _>(|i| (i == k) as u64);
+            assert_eq!(
+                slot_mul_mod(&monomial(1), &monomial(D - 1), alpha, P),
+                std::array::from_fn(|i| if i == 0 { alpha } else { 0 })
+            );
+            let mul = |a: &[u64; D], b: &[u64; D]| slot_mul_mod(a, b, alpha, P);
+            let add = |a: [u64; D], b: [u64; D]| {
+                std::array::from_fn(|i| ((a[i] as u128 + b[i] as u128) % P as u128) as u64)
+            };
+            for _ in 0..200 {
+                let mut random = || -> [u64; D] {
+                    std::array::from_fn(|_| match rng.random_range(0..3) {
+                        0 => P - 1 - rng.random_range(0..16),
+                        _ => rng.random_range(0..P),
+                    })
+                };
+                let (a, b, c) = (random(), random(), random());
+                assert_eq!(mul(&a, &b), mul(&b, &a));
+                assert_eq!(mul(&mul(&a, &b), &c), mul(&a, &mul(&b, &c)));
+                assert_eq!(mul(&a, &add(b, c)), add(mul(&a, &b), mul(&a, &c)));
+            }
+        }
+        check::<2>(&mut rng);
+        check::<3>(&mut rng);
+        check::<4>(&mut rng);
+    }
+
     #[test]
     fn test_strided_layout() {
         init_common();
@@ -1744,9 +2085,15 @@ mod tests {
             .iter()
             .step_by(NUM_SLOTS)
             .all(|&f| f == 1));
-        if SLOT_DEGREE == 4 {
-            let inverted = INVERTED_SLOTS.len();
-            assert!(0 < inverted && inverted < NUM_SLOTS, "{inverted} inverted");
+        match SLOT_DEGREE {
+            2 => assert!(INVERTED_SLOTS.is_empty()),
+            // The two cubic-residue classes of the `eta_j` have the same size.
+            3 => assert_eq!(INVERTED_SLOTS.len(), NUM_SLOTS / 2),
+            4 => {
+                let inverted = INVERTED_SLOTS.len();
+                assert!(0 < inverted && inverted < NUM_SLOTS, "{inverted} inverted");
+            }
+            _ => unreachable!(),
         }
         for _ in 0..8 {
             let a = RingElement::random(Representation::IncompleteNTT);
@@ -1816,24 +2163,23 @@ mod tests {
             RingElement::random_bounded(Representation::Coefficients, 10),
         ];
 
-        let mut two_norm_squared = 0u64;
+        // `ct(x conj x)` is `|x|^2` for `X^N + 1`, and `Tr(x conj x)/phi =
+        // sum x_i^2 + sum_{i < n} x_i x_{i+n}` for `X^{2n} - X^n + 1` (the note, Corollary 4.4).
+        let mut two_norm_squared = 0i128;
         for e in vector.iter_mut() {
-            for coeff in e.v.iter() {
-                let centered = if *coeff > MOD_Q / 2 {
-                    MOD_Q - *coeff // Interpret as negative
-                } else {
-                    *coeff
-                };
-                two_norm_squared = unsafe {
-                    add_mod(
-                        two_norm_squared,
-                        multiply_mod(centered, centered, MOD_Q),
-                        MOD_Q,
-                    )
-                };
+            let centered: Vec<i128> =
+                e.v.iter()
+                    .map(|&c| centered_i64_from_u64_mod_q_scalar(c) as i128)
+                    .collect();
+            two_norm_squared += centered.iter().map(|c| c * c).sum::<i128>();
+            if RING_FAMILY == RingFamily::Trinomial {
+                two_norm_squared += (0..HALF_DEGREE)
+                    .map(|i| centered[i] * centered[i + HALF_DEGREE])
+                    .sum::<i128>();
             }
             e.to_representation(Representation::IncompleteNTT);
         }
+        let two_norm_squared = reduce_signed_wide(two_norm_squared, MOD_Q);
 
         let mut vector_conj = vector.clone();
         for e in vector_conj.iter_mut() {
@@ -1850,7 +2196,7 @@ mod tests {
         inner_product.from_strided_coefficients_to_coefficients();
         let ct = inner_product.v[0];
 
-        debug_assert_eq!(ct, two_norm_squared);
+        assert_eq!(ct, two_norm_squared);
     }
 
     #[test]
@@ -1873,17 +2219,29 @@ mod tests {
         debug_assert_eq!(a, original);
     }
 
+    /// `Tr(x)/DEGREE`: `x_0` for `X^N + 1`, `x_0 + x_n / 2` for `X^{2n} - X^n + 1`.
     #[test]
-    fn test_constant_term_from_incomplete_ntt() {
+    fn test_trace_over_degree() {
         init_common();
 
-        let mut a = RingElement::random(Representation::IncompleteNTT);
-        let computed_constant_term = a.constant_term_from_incomplete_ntt();
-        a.from_incomplete_ntt_to_strided_coefficients();
-        a.from_strided_coefficients_to_coefficients();
-        let expected_constant_term = a.v[0];
-
-        debug_assert_eq!(expected_constant_term, computed_constant_term % MOD_Q);
+        for _ in 0..4 {
+            let mut a = RingElement::random(Representation::IncompleteNTT);
+            let computed = a.trace_over_degree();
+            a.from_incomplete_ntt_to_strided_coefficients();
+            a.from_strided_coefficients_to_coefficients();
+            let expected = match RING_FAMILY {
+                RingFamily::PowerOfTwo => a.v[0],
+                RingFamily::Trinomial => unsafe {
+                    add_mod(
+                        a.v[0],
+                        multiply_mod(a.v[HALF_DEGREE], inv_mod(2, MOD_Q), MOD_Q),
+                        MOD_Q,
+                    )
+                },
+            };
+            assert!(computed < MOD_Q);
+            assert_eq!(expected, computed);
+        }
     }
 
     /// Verifies that the fused incomplete-NTT multiplication kernel produces
@@ -2025,5 +2383,248 @@ mod tests {
         let one = RingElement::one(Representation::HomogenizedFieldExtensions);
         let one_inv = one.inverse();
         assert_eq!(one.v, one_inv.v, "1^{{-1}} should equal 1");
+    }
+
+    /// The fused slot product is the product modulo `X^D - zeta_i` slot by slot.
+    #[test]
+    fn test_slot_product_matches_slot_mul_mod() {
+        init_common();
+        for _ in 0..4 {
+            let a = RingElement::random(Representation::IncompleteNTT);
+            let b = RingElement::random(Representation::IncompleteNTT);
+            let c = &a * &b;
+            let slot = |x: &RingElement, i: usize| -> [u64; SLOT_DEGREE] {
+                std::array::from_fn(|r| x.v[r * NUM_SLOTS + i])
+            };
+            for i in 0..NUM_SLOTS {
+                let expected = slot_mul_mod(&slot(&a, i), &slot(&b, i), SHIFT_FACTORS[i], MOD_Q);
+                assert_eq!(slot(&c, i), expected, "slot {i}");
+            }
+        }
+    }
+
+    /// The slot dot products against sums of slot products.
+    #[test]
+    fn test_dot_products_match_sums_of_products() {
+        init_common();
+        let a: Vec<RingElement> = (0..6)
+            .map(|_| RingElement::random(Representation::IncompleteNTT))
+            .collect();
+        let b: Vec<RingElement> = (0..9)
+            .map(|_| RingElement::random(Representation::IncompleteNTT))
+            .collect();
+        let mut acc = RingElement::random(Representation::IncompleteNTT);
+        let mut expected = acc.clone();
+        for k in 0..3 {
+            expected += &(&a[2 * k] * &b[3 * k]);
+        }
+        incomplete_ntt_dot_into(&mut acc, &a, 2, &b, 3, 3);
+        assert_eq!(acc, expected);
+
+        let mut results = vec![RingElement::random(Representation::IncompleteNTT); 2];
+        let mut expected = results.clone();
+        for (o, expected) in expected.iter_mut().enumerate() {
+            for k in 0..3 {
+                *expected += &(&a[k] * &b[3 * k + o]);
+            }
+        }
+        incomplete_ntt_dot_many_into(&mut results, &a, 1, &b, 3, 3);
+        assert_eq!(results, expected);
+    }
+
+    /// The trinomial ring against the coefficient-domain reference vectors of
+    /// `goldilocks-note/port-checks/gen_vectors.py`.
+    #[cfg(rokoko_family = "trinomial")]
+    mod trinomial {
+        use super::*;
+        use crate::common::arithmetic::field_to_ring_element;
+
+        /// `build.rs` admits only `k = 5` for the trinomial family.
+        const VECTORS: &str = match DEGREE {
+            96 => include_str!("../../incomplete-rexl/tests/vectors/trinomial_k5.txt"),
+            _ => panic!("no reference vectors for this degree"),
+        };
+
+        fn vectors() -> impl Iterator<Item = (&'static str, Vec<u64>)> {
+            VECTORS
+                .lines()
+                .map(|line| line.split('#').next().unwrap().trim())
+                .filter(|line| !line.is_empty())
+                .map(|line| {
+                    let mut fields = line.split_whitespace();
+                    let op = fields.next().unwrap();
+                    let numbers = fields
+                        .map(|x| u64::from_str_radix(x.trim_start_matches("0x"), 16).unwrap())
+                        .collect();
+                    (op, numbers)
+                })
+        }
+
+        fn element(coefficients: &[u64]) -> RingElement {
+            let mut element = RingElement::new(Representation::Coefficients);
+            element.v.copy_from_slice(coefficients);
+            element
+        }
+
+        fn in_representation(x: &RingElement, representation: Representation) -> RingElement {
+            let mut x = x.clone();
+            x.to_representation(representation);
+            x
+        }
+
+        #[test]
+        fn ring_vectors() {
+            init_common();
+            let mut counts = std::collections::BTreeMap::new();
+            for (op, v) in vectors() {
+                match op {
+                    "mul" => {
+                        let (a, b) = (element(&v[..DEGREE]), element(&v[DEGREE..2 * DEGREE]));
+                        let expected = &v[2 * DEGREE..];
+                        let mut naive = RingElement::new(Representation::Coefficients);
+                        naive_polynomial_multiplication(&mut naive, &a, &b);
+                        assert_eq!(naive.v, expected);
+                        let ntt = &in_representation(&a, Representation::IncompleteNTT)
+                            * &in_representation(&b, Representation::IncompleteNTT);
+                        assert_eq!(
+                            in_representation(&ntt, Representation::Coefficients).v,
+                            expected
+                        );
+                        let mut homogenized =
+                            RingElement::new(Representation::HomogenizedFieldExtensions);
+                        incomplete_ntt_multiplication_homogenized(
+                            &mut homogenized,
+                            &in_representation(&a, Representation::HomogenizedFieldExtensions),
+                            &in_representation(&b, Representation::HomogenizedFieldExtensions),
+                        );
+                        let back = in_representation(&homogenized, Representation::Coefficients);
+                        assert_eq!(back.v, expected);
+                    }
+                    "conj" => {
+                        let (a, expected) = (element(&v[..DEGREE]), &v[DEGREE..]);
+                        let mut reference = a.clone();
+                        reference.conjugate_coefficients_ref();
+                        assert_eq!(reference.v, expected);
+                        let mut ntt = in_representation(&a, Representation::IncompleteNTT);
+                        ntt.conjugate_in_place();
+                        assert_eq!(
+                            in_representation(&ntt, Representation::Coefficients).v,
+                            expected
+                        );
+                    }
+                    "trace" => {
+                        let a = in_representation(
+                            &element(&v[..DEGREE]),
+                            Representation::IncompleteNTT,
+                        );
+                        assert_eq!(a.trace_over_degree(), v[DEGREE]);
+                    }
+                    "tau" => assert_eq!(subfield_generator().v, &v[..]),
+                    "eval" => {
+                        let (eta, a) = (v[0], element(&v[1..1 + DEGREE]));
+                        let i = SHIFT_FACTORS.iter().position(|&z| z == eta).unwrap();
+                        let a = in_representation(&a, Representation::IncompleteNTT);
+                        let slot: Vec<u64> = (0..3).map(|r| a.v[r * NUM_SLOTS + i]).collect();
+                        assert_eq!(slot, &v[1 + DEGREE..]);
+                    }
+                    _ => panic!("unknown op {op}"),
+                }
+                *counts.entry(op).or_insert(0) += 1;
+            }
+            assert!(counts.len() == 5 && counts["mul"] >= 10, "{counts:?}");
+        }
+
+        /// The roots of the slots are the primitive `3 * NUM_SLOTS`-th roots of unity, each once.
+        #[test]
+        fn shift_factors_are_the_primitive_roots() {
+            init_common();
+            let mut roots = SHIFT_FACTORS.to_vec();
+            roots.sort();
+            roots.dedup();
+            assert_eq!(roots.len(), NUM_SLOTS);
+            for &eta in SHIFT_FACTORS.iter() {
+                let order = 3 * NUM_SLOTS as u64;
+                assert_eq!(unsafe { power_mod(eta, order / 2, MOD_Q) }, MOD_Q - 1);
+                assert_ne!(unsafe { power_mod(eta, order / 3, MOD_Q) }, 1);
+            }
+        }
+
+        /// `tau` is diagonal once homogenized, `T^3 - 3T + 1 = 0` for its common slot `T`, and
+        /// `T` is the image of `tau` in slot 0 (whose homogenization is the identity).
+        #[test]
+        fn tau_is_diagonal_after_homogenization() {
+            init_common();
+            let tau = in_representation(&subfield_generator(), Representation::IncompleteNTT);
+            let homogenized = in_representation(&tau, Representation::HomogenizedFieldExtensions);
+            let slots = homogenized.split_into_field_extensions();
+            let t = slots[0];
+            assert!(slots.iter().all(|&s| s == t));
+            assert_eq!(t, tau.slot_zero());
+            let three = FieldExtension::from_base(3);
+            let mut cubic = t * t * t;
+            cubic -= &(three * t);
+            cubic += &FieldExtension::from_base(1);
+            assert_eq!(cubic, FieldExtension::from_base(0));
+            assert_eq!(field_to_ring_element(&t), homogenized);
+        }
+
+        /// The diagonal is `Z_p[tau]`, so conjugation fixes every challenge-field element.
+        #[test]
+        fn conjugation_fixes_the_challenge_field() {
+            init_common();
+            let mut rng = rand::rngs::StdRng::seed_from_u64(13);
+            for _ in 0..16 {
+                let f = FieldExtension {
+                    coeffs: std::array::from_fn(|_| rng.random_range(0..MOD_Q)),
+                };
+                let r =
+                    in_representation(&field_to_ring_element(&f), Representation::IncompleteNTT);
+                assert_eq!(r.conjugate(), r);
+                let mut reference = r.clone();
+                reference.conjugate_in_place_ref();
+                assert_eq!(reference, r);
+            }
+            // A random ring element is not fixed.
+            let r = RingElement::random(Representation::IncompleteNTT);
+            assert_ne!(r.conjugate(), r);
+        }
+
+        /// A diagonal element is `g(tau)` for `g` of degree 2: its coefficients lie in the span of
+        /// `1, tau, tau^2`.
+        #[test]
+        fn the_diagonal_is_spanned_by_powers_of_tau() {
+            init_common();
+            let tau = in_representation(&subfield_generator(), Representation::IncompleteNTT);
+            let t = in_representation(&tau, Representation::HomogenizedFieldExtensions)
+                .split_into_field_extensions()[0];
+            let mut rng = rand::rngs::StdRng::seed_from_u64(17);
+            let g: [u64; 3] = std::array::from_fn(|_| rng.random_range(0..MOD_Q));
+            // `g(T)` in the slots, and `g(tau)` in the ring.
+            let g_t = FieldExtension::from_base(g[0])
+                + FieldExtension::from_base(g[1]) * t
+                + FieldExtension::from_base(g[2]) * t * t;
+            let mut g_tau = RingElement::constant(g[0], Representation::IncompleteNTT);
+            g_tau += &(&RingElement::constant(g[1], Representation::IncompleteNTT) * &tau);
+            let tau2 = &tau * &tau;
+            g_tau += &(&RingElement::constant(g[2], Representation::IncompleteNTT) * &tau2);
+            let embedded =
+                in_representation(&field_to_ring_element(&g_t), Representation::IncompleteNTT);
+            assert_eq!(embedded, g_tau);
+        }
+
+        /// The slot transform reads any `u64` modulo `p`: `RingElement::all` and `constant` keep
+        /// their value unreduced.
+        #[test]
+        fn incomplete_ntt_reduces_on_load() {
+            init_common();
+            let wide = RingElement::all(u64::MAX, Representation::IncompleteNTT);
+            let reduced = RingElement::all(u64::MAX - MOD_Q, Representation::IncompleteNTT);
+            assert_eq!(wide, reduced);
+            let wide = RingElement::constant(MOD_Q + 5, Representation::HomogenizedFieldExtensions);
+            assert_eq!(
+                wide,
+                RingElement::constant(5, Representation::HomogenizedFieldExtensions)
+            );
+        }
     }
 }

@@ -393,8 +393,11 @@ pub fn verifier_round_intermediate(
                     }
                 }
 
-                let ct = round_proof.batched_projection_image[(i, col)]
-                    .constant_term_from_incomplete_ntt();
+                // `Tr/phi` of the batched image, which is its constant term for `X^N + 1`. The
+                // identity it checks holds for the trinomial family only once the fine
+                // projection is lifted through the trace-dual basis (`conj(M j)` rather than
+                // `conj(j)`), which is still to do with the projection shapes.
+                let ct = round_proof.batched_projection_image[(i, col)].trace_over_degree();
                 assert_eq!(ct, expected_ct);
             }
         }
@@ -716,7 +719,8 @@ pub fn verifier_round_simple(
         );
 
         for k in 0..config.witness_width {
-            let mut expected_ct = 0;
+            // A sum of `c_1_values.len()` residues, exact in `u128` for any `q < 2^64`.
+            let mut expected_ct = 0u128;
             for j in 0..c_1_values.len() / DEGREE {
                 unsafe {
                     eltwise_mult_mod(
@@ -729,13 +733,13 @@ pub fn verifier_round_simple(
                 }
                 for l in 0..DEGREE {
                     // TODO: vectorize
-                    expected_ct += temp.v[l];
+                    expected_ct += temp.v[l] as u128;
                 }
             }
-            expected_ct %= MOD_Q;
+            let expected_ct = (expected_ct % MOD_Q as u128) as u64;
 
-            let ct =
-                round_proof.batched_projection_image[(i, k)].constant_term_from_incomplete_ntt();
+            // `Tr/phi`, the constant term for `X^N + 1`; see the intermediate check above.
+            let ct = round_proof.batched_projection_image[(i, k)].trace_over_degree();
             assert_eq!(ct, expected_ct);
         }
     }

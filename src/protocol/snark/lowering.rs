@@ -199,9 +199,9 @@ fn sub_table(pf: &PublicFactor) -> SubTable<'_> {
 }
 
 /// The merged table `sum_a gamma_a * prod_f factor_{a,f}` a combination weight
-/// folds over its union window. All-scalar components take a lazy-reduction
-/// path: per coefficient, the gamma-scaled terms accumulate in u128 (each
-/// product < 2^102, so up to 32 components fit) with one reduction at the end.
+/// folds over its union window. All-scalar components take a scalar path: one
+/// fused multiply-add of `gamma_a` per component, reduced mod q at every step,
+/// so neither the number of components nor the width of q is capped.
 fn expand_combination(
     parts: &[(RingElement, Vec<PublicFactor>)],
     union_prefix: usize,
@@ -249,10 +249,6 @@ fn expand_combination(
         });
 
     if !scalar_components.is_empty() {
-        assert!(
-            scalar_components.len() <= 32,
-            "lazy accumulation caps at 32 components"
-        );
         let mut cs = vec![0u64; scalar_components.len()];
         for (i, m) in merged.iter_mut().enumerate() {
             for (a, comp) in scalar_components.iter().enumerate() {

@@ -98,7 +98,7 @@ pub fn claim_over_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::common::config::MOD_Q;
+    use crate::common::arithmetic::signed_mod_q;
 
     #[test]
     fn test_opening() {
@@ -158,96 +158,96 @@ mod tests {
         debug_assert_eq!(
             opening.rhs[(0, 0)],
             RingElement::constant(
-                (MOD_Q as i64
-                    + ((1 - 17) * (1 - 18) * 1
+                signed_mod_q(
+                    (1 - 17) * (1 - 18) * 1
                         + (1 - 17) * (18) * 2
                         + (17) * (1 - 18) * 3
-                        + (17) * (18) * 4)) as u64
-                    % MOD_Q,
+                        + (17) * (18) * 4
+                ),
                 Representation::IncompleteNTT
             )
         );
         debug_assert_eq!(
             opening.rhs[(0, 1)],
             RingElement::constant(
-                (MOD_Q as i64
-                    + ((1 - 17) * (1 - 18) * 5
+                signed_mod_q(
+                    (1 - 17) * (1 - 18) * 5
                         + (1 - 17) * (18) * 6
                         + (17) * (1 - 18) * 7
-                        + (17) * (18) * 8)) as u64
-                    % MOD_Q,
+                        + (17) * (18) * 8
+                ),
                 Representation::IncompleteNTT
             )
         );
         debug_assert_eq!(
             opening.rhs[(0, 2)],
             RingElement::constant(
-                (MOD_Q as i64
-                    + ((1 - 17) * (1 - 18) * 9
+                signed_mod_q(
+                    (1 - 17) * (1 - 18) * 9
                         + (1 - 17) * (18) * 10
                         + (17) * (1 - 18) * 11
-                        + (17) * (18) * 12)) as u64
-                    % MOD_Q,
+                        + (17) * (18) * 12
+                ),
                 Representation::IncompleteNTT
             )
         );
         debug_assert_eq!(
             opening.rhs[(0, 3)],
             RingElement::constant(
-                (MOD_Q as i64
-                    + ((1 - 17) * (1 - 18) * 13
+                signed_mod_q(
+                    (1 - 17) * (1 - 18) * 13
                         + (1 - 17) * (18) * 14
                         + (17) * (1 - 18) * 15
-                        + (17) * (18) * 16)) as u64
-                    % MOD_Q,
+                        + (17) * (18) * 16
+                ),
                 Representation::IncompleteNTT
             )
         );
         debug_assert_eq!(
             opening.rhs[(1, 0)],
             RingElement::constant(
-                (MOD_Q as i64
-                    + ((1 - 19) * (1 - 20) * 1
+                signed_mod_q(
+                    (1 - 19) * (1 - 20) * 1
                         + (1 - 19) * (20) * 2
                         + (19) * (1 - 20) * 3
-                        + (19) * (20) * 4)) as u64
-                    % MOD_Q,
+                        + (19) * (20) * 4
+                ),
                 Representation::IncompleteNTT
             )
         );
         debug_assert_eq!(
             opening.rhs[(1, 1)],
             RingElement::constant(
-                (MOD_Q as i64
-                    + ((1 - 19) * (1 - 20) * 5
+                signed_mod_q(
+                    (1 - 19) * (1 - 20) * 5
                         + (1 - 19) * (20) * 6
                         + (19) * (1 - 20) * 7
-                        + (19) * (20) * 8)) as u64
-                    % MOD_Q,
+                        + (19) * (20) * 8
+                ),
                 Representation::IncompleteNTT
             )
         );
         debug_assert_eq!(
             opening.rhs[(1, 2)],
             RingElement::constant(
-                (MOD_Q as i64
-                    + ((1 - 19) * (1 - 20) * 9
+                signed_mod_q(
+                    (1 - 19) * (1 - 20) * 9
                         + (1 - 19) * (20) * 10
                         + (19) * (1 - 20) * 11
-                        + (19) * (20) * 12)) as u64
-                    % MOD_Q,
+                        + (19) * (20) * 12
+                ),
                 Representation::IncompleteNTT
             )
         );
         debug_assert_eq!(
             opening.rhs[(1, 3)],
             RingElement::constant(
-                (MOD_Q as i64
-                    + ((1 - 19) * (1 - 20) * 13
+                signed_mod_q(
+                    (1 - 19) * (1 - 20) * 13
                         + (1 - 19) * (20) * 14
                         + (19) * (1 - 20) * 15
-                        + (19) * (20) * 16)) as u64
-                    % MOD_Q,
+                        + (19) * (20) * 16
+                ),
                 Representation::IncompleteNTT
             )
         );
