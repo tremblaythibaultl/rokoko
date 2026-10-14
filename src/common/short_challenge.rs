@@ -16,7 +16,7 @@
 //!   canonical embedding, so `||sigma(c)||_inf` is exactly the coefficient-embedding operator
 //!   norm `||c||_op`.
 //! - For `Z_p[X]/(X^{2n} - X^n + 1)`, `X^{2n} - X^n + 1 = Phi_m(X)` with `m = 9 * 2^k = 3 phi`,
-//!   and `j = 1, 5 mod 6`. Here `||c||_op <= sqrt(3) ||sigma(c)||_inf` only (the note, Lemma 3.8),
+//!   and `j = 1, 5 mod 6`. Here `||c||_op <= sqrt(3) ||sigma(c)||_inf` only (the note, Lemma 4.7),
 //!   so a challenge accepted at T_OP_NORM_BOUND has operator norm at most [`GAMMA_C`].
 
 use crate::common::config::{RingFamily, DEGREE, MOD_Q, RING_FAMILY};
@@ -30,7 +30,7 @@ include!(concat!(env!("OUT_DIR"), "/challenge.rs"));
 /// Bound on the coefficient-embedding operator norm `gamma_C = max ||c||_op` of every challenge
 /// [`sample_short_challenge`] accepts. The sampler bounds `||sigma(c)||_inf` by
 /// T_OP_NORM_BOUND; for `X^N + 1` the two norms coincide, and for `X^{2n} - X^n + 1` the note's
-/// Lemma 3.8 gives `||c||_op <= sqrt(3) ||sigma(c)||_inf`.
+/// Lemma 4.7 gives `||c||_op <= sqrt(3) ||sigma(c)||_inf`.
 pub const GAMMA_C: f64 = match RING_FAMILY {
     RingFamily::PowerOfTwo => T_OP_NORM_BOUND,
     RingFamily::Trinomial => SQRT_3 * T_OP_NORM_BOUND,
@@ -771,7 +771,7 @@ mod tests {
 
     /// Accepted challenges have coefficient operator norm at most `GAMMA_C`. For the trinomial
     /// family it exceeds `||sigma(c)||_inf`, and so T_OP_NORM_BOUND, on some samples: the factor
-    /// `sqrt(3)` of Lemma 3.8 is needed. For `X^N + 1` the two norms agree.
+    /// `sqrt(3)` of Lemma 4.7 is needed. For `X^N + 1` the two norms agree.
     #[test]
     fn challenges_have_operator_norm_at_most_gamma_c() {
         let mut hasher = HashWrapper::new();

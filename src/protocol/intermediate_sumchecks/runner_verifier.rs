@@ -68,7 +68,7 @@ pub fn intermediate_sumcheck_verifier(
     hash_wrapper.sample_ring_element_vec_into(&mut combination);
 
     // `Tr/phi` of `<w, conj w>`, the squared canonical norm over the degree: the constant term
-    // for `X^N + 1`, and what certifies the norm in either family (the note, Corollary 3.5).
+    // for `X^N + 1`, and what certifies the norm in either family (the note, Corollary 4.4).
     let norm_ct = proof.norm_claim.trace_over_degree();
     assert_norm_bounded(
         "norm claim via inner-product (intermediate)",

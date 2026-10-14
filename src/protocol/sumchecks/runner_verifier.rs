@@ -280,7 +280,7 @@ pub fn sumcheck_verifier(
     }
 
     // The norm claims below are `<w, conj w>`, whose `Tr/phi` is the squared canonical norm over
-    // the degree (the constant term for `X^N + 1`; the note, Corollary 3.5).
+    // the degree (the constant term for `X^N + 1`; the note, Corollary 4.4).
     let norm_ct = round_proof.norm_claim.trace_over_degree();
     assert_norm_bounded(
         "norm claim via inner-product",

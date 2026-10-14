@@ -287,7 +287,7 @@ Results: `incomplete-rexl` 9 unit + 6 Goldilocks + 27 integration pass in releas
 **Main crate (`ring_arithmetic.rs`).**
 
 - `SLOT_RING` is `SlotRing` or `TrinomialSlotRing` by family. `SHIFT_FACTORS` is, for the trinomial family, part 0 of the slot transform of `Y = X^3`, that is `eta_j` in slot order; the power-of-two derivation is unchanged.
-- `naive_polynomial_multiplication` reduces through `X^{2n} = X^n - 1` from the top down. `conjugate_in_place_ref` goes through `conjugate_coefficients`, which uses the note's eq. (negpow) for the trinomial family.
+- `naive_polynomial_multiplication` reduces through `X^{2n} = X^n - 1` from the top down. `conjugate_in_place_ref` goes through `conjugate_coefficients`, which uses the note's eq. (1) for the trinomial family.
 - `derive_conjugation_transform` is reused unchanged: in slot `j`, `X^{-1} = eta_j^{-1} X^2`, so every basis vector of part `r` lands in exactly one slot of part `(3 - r) mod 3`. Its `debug_assert` on that holds at `k = 5` and `k = 6`.
 - Homogenization (Finding 5), `degree3_homogenization`. With `eta_i = alpha^{e_i}`:
   - slots with `e_i = 1 mod 3` use `X -> c Y`, `c^3 = eta_i/alpha`;

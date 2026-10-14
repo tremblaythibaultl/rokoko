@@ -678,8 +678,8 @@ impl RingElement {
     /// - For `X^N + 1` (`RingFamily::PowerOfTwo`) this is the constant term `x_0`: the trace of
     ///   `X^t` vanishes for `0 < t < N`.
     /// - For `X^{2n} - X^n + 1` (`RingFamily::Trinomial`) it is NOT the constant term but
-    ///   `x_0 + x_n / 2` (the note, Corollary 3.4): the trace of `X^{+-n}` is `phi / 2`. The constant
-    ///   term and `Tr/phi` agree on elements `x conj(x)` (Corollary 3.5), which is what the norm
+    ///   `x_0 + x_n / 2` (the note, Corollary 4.3): the trace of `X^{+-n}` is `phi / 2`. The constant
+    ///   term and `Tr/phi` agree on elements `x conj(x)` (Corollary 4.4), which is what the norm
     ///   checks need.
     pub fn trace_over_degree(&self) -> u64 {
         debug_assert_eq!(self.representation, Representation::IncompleteNTT);
@@ -1213,7 +1213,7 @@ fn naive_trinomial_multiplication(
 /// `x(X^{-1})` of the coefficients `x`, reduced mod `q`.
 ///
 /// - `X^N + 1`: `X^{-t} = -X^{N-t}`, which reverses and negates `x_1, ..., x_{N-1}`.
-/// - `X^{2n} - X^n + 1`: `X^{3n} = -1` gives the note's eq. (negpow), `X^{-t} = -X^{3n-t}` for
+/// - `X^{2n} - X^n + 1`: `X^{3n} = -1` gives the note's eq. (1), `X^{-t} = -X^{3n-t}` for
 ///   `n < t < 2n`, `1 - X^n` for `t = n` and `X^{n-t} - X^{2n-t}` for `0 < t < n`.
 fn conjugate_coefficients(v: &mut [u64; DEGREE]) {
     match RING_FAMILY {
@@ -1252,7 +1252,7 @@ fn conjugate_coefficients(v: &mut [u64; DEGREE]) {
 
 /// `tau = X^{h} + X^{2h} - X^{4h}`, `h = NUM_SLOTS / 2 = 2^{k-1}`, in Coefficients form: the
 /// generator of the subfield `Z_p[tau] = F_{p^3}` of the trinomial ring, with
-/// `tau^3 - 3 tau + 1 = 0` (the note, Proposition 3.3). Trinomial family only.
+/// `tau^3 - 3 tau + 1 = 0` (the note, Proposition 3.4). Trinomial family only.
 pub fn subfield_generator() -> RingElement {
     assert_eq!(RING_FAMILY, RingFamily::Trinomial);
     let h = NUM_SLOTS / 2;
@@ -2164,7 +2164,7 @@ mod tests {
         ];
 
         // `ct(x conj x)` is `|x|^2` for `X^N + 1`, and `Tr(x conj x)/phi =
-        // sum x_i^2 + sum_{i < n} x_i x_{i+n}` for `X^{2n} - X^n + 1` (the note, Corollary 3.5).
+        // sum x_i^2 + sum_{i < n} x_i x_{i+n}` for `X^{2n} - X^n + 1` (the note, Corollary 4.4).
         let mut two_norm_squared = 0i128;
         for e in vector.iter_mut() {
             let centered: Vec<i128> =
