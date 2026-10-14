@@ -2439,9 +2439,9 @@ mod tests {
         use super::*;
         use crate::common::arithmetic::field_to_ring_element;
 
+        /// `build.rs` admits only `k = 5` for the trinomial family.
         const VECTORS: &str = match DEGREE {
             96 => include_str!("../../incomplete-rexl/tests/vectors/trinomial_k5.txt"),
-            192 => include_str!("../../incomplete-rexl/tests/vectors/trinomial_k6.txt"),
             _ => panic!("no reference vectors for this degree"),
         };
 

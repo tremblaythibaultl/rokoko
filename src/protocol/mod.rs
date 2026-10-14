@@ -12,7 +12,13 @@ pub mod params;
 pub mod parties;
 pub mod project_coarse;
 pub mod project_fine;
+// SNARK mode and its exact-norm chains are out of scope for the trinomial (Goldilocks) family:
+// only the PCS chains are ported (docs/goldilocks-port.md). Nothing outside SNARK mode uses
+// this module.
+#[cfg(not(rokoko_family = "trinomial"))]
 pub mod snark;
+#[cfg(all(feature = "snark", rokoko_family = "trinomial"))]
+compile_error!("SNARK mode (`--features snark`) is out of scope for the trinomial (Goldilocks) family");
 pub mod sumcheck;
 pub mod sumcheck_utils;
 pub mod sumchecks;

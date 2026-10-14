@@ -1,3 +1,6 @@
+#[cfg(rokoko_family = "trinomial")]
+compile_error!("the SNARK claim language is out of scope for the trinomial (Goldilocks) family");
+
 use rokoko::common::decomposition::decompose;
 use rokoko::common::init_common;
 use rokoko::common::ring_arithmetic::{Representation, RingElement};

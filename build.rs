@@ -23,7 +23,8 @@ enum Family {
     /// `Z_q[X]/(X^N + 1)`, `N` a power of two (conductor `2N`): the default.
     PowerOfTwo,
     /// `Z_p[X]/(X^{2n} - X^n + 1)`, `n = 3 * 2^{k-1}`, of conductor `9 * 2^k` and degree
-    /// `phi = 3 * 2^k`, over the Goldilocks prime `p = 2^64 - 2^32 + 1`.
+    /// `phi = 3 * 2^k`, over the Goldilocks prime `p = 2^64 - 2^32 + 1`. Only `k = 5` (degree 96,
+    /// conductor 288) is supported.
     Trinomial,
 }
 
@@ -175,8 +176,8 @@ const Q_MAX_BITS: u32 = 50;
 
 /// The Goldilocks prime `2^64 - 2^32 + 1`, the modulus of the trinomial family.
 const GOLDILOCKS_P: u64 = 0xffff_ffff_0000_0001;
-/// The exponents `k` of the trinomial family's degrees `3 * 2^k`.
-const TRINOMIAL_K: [u32; 2] = [5, 6];
+/// The degree `3 * 2^5` of the trinomial family (conductor 288): only `k = 5` is supported.
+const TRINOMIAL_DEGREE: u64 = 96;
 
 fn validate_ring(spec: &RingSpec) -> Result<(), String> {
     match spec.family {
@@ -203,12 +204,13 @@ fn validate_ring(spec: &RingSpec) -> Result<(), String> {
 }
 
 /// `X^{2n} - X^n + 1 = Phi_{9 * 2^k}` of degree `3 * 2^k` over Goldilocks: it splits into `2^k`
-/// irreducible cubics `X^3 - eta_j`, `eta_j` the primitive `3 * 2^k`-th roots of unity.
+/// irreducible cubics `X^3 - eta_j`, `eta_j` the primitive `3 * 2^k`-th roots of unity. Here
+/// `k = 5`: `X^96 - X^48 + 1 = Phi_288`, 32 slots.
 fn validate_trinomial(spec: &RingSpec) -> Result<(), String> {
     let (n, q) = (spec.degree, spec.mod_q);
-    if !TRINOMIAL_K.iter().any(|&k| n == 3 << k) {
+    if n != TRINOMIAL_DEGREE {
         return Err(format!(
-            "degree {n} must be 3 * 2^k with k in {TRINOMIAL_K:?} for the trinomial family"
+            "degree {n} must be {TRINOMIAL_DEGREE} (conductor 288) for the trinomial family"
         ));
     }
     if q != GOLDILOCKS_P {

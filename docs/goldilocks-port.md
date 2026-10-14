@@ -1,25 +1,42 @@
 # Porting RoKoko to Goldilocks
 
-This plan adapts the implementation to the Goldilocks prime `p = 2^64 - 2^32 + 1` and the cyclotomic ring of conductor `m = 9 * 2^k`:
+This plan adds one ring to RoKoko, next to the default ring (d2) and `n128_d4` (d4): the Goldilocks prime `p = 2^64 - 2^32 + 1` with the cyclotomic ring of conductor `m = 288`,
 
 ```
-R_p = Z_p[X] / (X^{2n} - X^n + 1),   n = 3 * 2^{k-1},   phi = 3 * 2^k   (k = 5: phi = 96, k = 6: phi = 192)
+R_p = Z_p[X] / (X^96 - X^48 + 1) = Z_p[X] / Phi_288(X),   N = phi = 96,   n = 48
 ```
 
-It follows the note `goldilocks-note/rokoko-goldilocks.tex`, abbreviated "the note" below. The ring splits into `2^k` cubic slots `F_p[X]/(X^3 - eta_j)` with `eta_j` the primitive `3 * 2^k`-th roots of unity, and contains the subfield `F_{p^3} = Z_p[tau]` with `tau = X^{2^{k-1}} + X^{2^k} - X^{2^{k+1}}`.
+The ring splits into 32 cubic slots `F_p[X]/(X^3 - eta_j)` (`eta_j` the primitive 96th roots of unity, the powers `4^k`, `gcd(k, 96) = 1`), and contains the subfield `F_{p^3} = Z_p[tau]` with `tau = X^16 + X^32 - X^64`.
 
-The facts marked *(checked)* were verified numerically for `k = 5` and `k = 6` by the scripts in `goldilocks-note/port-checks/`.
+Two documents drive the plan:
+
+- **The note**, `goldilocks-note/rokoko-goldilocks.tex`. It treats the family `X^{2n} - X^n + 1`, `n = 3 * 2^{k-1}`, of conductor `9 * 2^k`; this ring is its `k = 5`. Citations use the numbering of the compiled note.
+- **The proposal**, the maintainer's `goldilocks-288-proposal.pdf` ("Proposal: rokoko over Goldilocks, conductor 288", outside the repo, next to the note). It fixes the scope, the order of the work (a stack of 7 PRs) and several design choices. Section "Alignment with the proposal" below lists where this plan follows it and where it does not.
+
+The facts marked *(checked)* were verified numerically by the scripts in `goldilocks-note/port-checks/`.
+
+## Scope
+
+From the proposal, accepted by the user:
+
+- **One ring, conductor 288.** `Phi_576` (`k = 6`, `N = 192`) is not upstreamed: a sent ring element costs 1.50 KB against 0.75 KB, and the degree-256 power-of-two ring already ended at about 150 KB of wire size against 112 KB. The backend in `incomplete-rexl` stays generic in `k`; the main crate accepts only `N = 96`.
+- **PCS parameter sets only**, `p-26` then `p-28`. SNARK mode (`--features snark`) and the exact-norm (EN) parameter sets are out of scope. Building SNARK mode for the trinomial family is a compile error.
+- **Every PR keeps the d2 and d4 proofs byte-identical** to `main` (`9023459`). This is checked by comparing proof hashes at `p-26` and `p-28` on both rings, not only proof sizes.
+- **Selected through `ROKOKO_RING`** like the other rings, with its parameters in its own instantiation module.
 
 ## Decisions
 
 | Question | Decision |
 |---|---|
-| Degree | Support `k = 5` and `k = 6` through ring spec files; develop and test on `k = 5` first. |
-| Fine projection rows `n_rp` | `n_rp = 384`, with the JL constants re-derived. Fallback: keep 256 and zero-pad the image to a power of two of ring elements. |
-| Arithmetic backend | A Goldilocks module inside `incomplete-rexl`, scalar first, SIMD later (Phase 7). No external field crate. |
-| Existing rings | They keep building and passing their tests. The field is selected at compile time from the ring spec, so the current suite stays a regression oracle. |
-| Challenge field inside `R_p` | The diagonal of the homogenized slots, with homogenization constants chosen so that the diagonal is `Z_p[tau]` (see Finding 5). |
-| Projection batches | `n_bat = 2` at `p` (the note, Section 4.2). |
+| Ring | Conductor 288, `N = 96` only (see Scope). |
+| Fine projection rows `n_rp` | **Provisional:** `n_rp = 384`, an image of exactly 4 ring elements, with the JL constants re-derived. The proposal keeps 256 rows in 3 ring elements with 32 zero coefficients; that shape does not tile the power-of-two placements (Finding 9). Settle with the maintainer before PR 4. |
+| Arithmetic backend | A Goldilocks module inside `incomplete-rexl`, no external field crate. Scalar first; AVX-512 IFMA later (proposal, Section 2.5). No NEON: aarch64 keeps the scalar fallback. |
+| Existing rings | Unchanged, byte for byte. The family is selected at compile time from the ring spec, so the existing suite stays a regression oracle. |
+| Challenge field inside `R_p` | The diagonal of the homogenized slots, with the cube roots aligned on `tau` so that the diagonal is `Z_p[tau]` and `conj(r) = r` (Finding 5). The proposal's `alpha = 4` with cube roots `x^e` gives another copy of `F_{p^3}`, not fixed by conjugation; both are correct, and this plan keeps the aligned one. |
+| Projection batches | `n_bat = 2` at `p` (the note, Section 5.2). |
+| Fold challenges | Fixed weight `tau = 40`, rejection on `||sigma(c)||_inf <= 12.4`, so `gamma_C = sqrt(3) * 12.4 = 21.48` (the proposal's operating point, Section 2.4; Finding 6). |
+| Norm check | `Tr(v)/phi <= (3/2) beta^2`, extracted bound `sqrt(3) beta`, and the no-wrap guard `(3/2) r' beta'^2 < p/2` (Finding 8; the proposal, Section 2.3). |
+| Process | The proposal's 7 stacked PRs. The phase commits made so far are re-split into PRs 1-4. |
 
 ## Findings that go beyond the note
 
@@ -30,120 +47,101 @@ The facts marked *(checked)* were verified numerically for `k = 5` and `k = 6` b
    - `HALF_WAY_MOD_Q = floor(2^64 / 4q) * q` becomes 0 (or panics in dev builds).
    - `MOD_Q as i64` is negative for `q > 2^63`.
 
-   Goldilocks gets its own reduction, using `2^64 = 2^32 - 1 mod p`.
-2. **Slot NTT.** In `Y = X^3`, `Y^{2^k} - Y^{2^{k-1}} + 1 = (Y^{2^{k-1}} - w6)(Y^{2^{k-1}} - w6^5)` with `w6` a primitive sixth root of unity. The transform of each strided part is therefore one trinomial butterfly layer followed by two twisted power-of-two NTTs of length `2^{k-1}` (the NTTRU construction). No radix-3 layer is needed. The current strided layout (part `r` holds `c_{3s+r}`) is already the note's decomposition `x_0(Y) + X x_1(Y) + X^2 x_2(Y)`.
-3. **`constant_term_from_incomplete_ntt` computes `Tr(x)/phi = x_0 + x_n/2` in this ring** *(checked)*. Every protocol use of it (the norm check on `<w, conj w>` and the `Tr(r_i) = 0` checks) needs exactly `Tr/phi` (the note, Corollaries 3.4 and 3.5). Rename it `trace_over_degree`, keep it, and fix its unreduced `u64` sum.
-4. **The fine projection's dual lift is wrong for this ring.** The code lifts `J_batched` with `conj(j)`, which relies on `ct(conj(a) b) = <cf a, cf b>`. That identity fails here *(checked)*.
-   - The correct lift is `j_hat = conj(M j)`. `M` mixes each coefficient pair `(i, i+n)` with `(4/3) [[1, -1/2], [-1/2, 1]]`, so that `Tr(j_hat x)/phi = <j, x>` *(checked)*.
-   - Equivalently, the trace-dual basis is `b_i^v = (4 / (3 phi)) (X^{-i} - X^{-(i +- n)} / 2)`.
-   - Call sites: `project_fine.rs:142, 327`, the AVX reversal at `project_fine.rs:335-375`, `loader.rs:212`, `loader_verifier.rs:158`.
+   Goldilocks gets its own reduction, using `2^64 = 2^32 - 1` and `2^96 = -1 mod p`.
+2. **Slot NTT.** `X^96 - X^48 + 1 = (X^48 + w)(X^48 + w^2)` with `w = 2^32 - 1` a primitive cube root of unity, then radix-2 layers down to the cubics. No radix-3 layer is needed. The code applies the same factorisation to each strided part in `Y = X^3` (the NTTRU construction): one trinomial layer, then two twisted power-of-two NTTs of length 16. Every slot root and twiddle is a power of 2 (`theta = 7^((p-1)/96) = 2^154`, *checked*), so a later kernel can multiply by them with shifts.
+3. **`constant_term_from_incomplete_ntt` computes `Tr(x)/phi = x_0 + x_48/2` in this ring** *(checked)*. Every protocol use of it (the norm check on `<w, conj w>` and the `Tr(r_i) = 0` checks) needs exactly `Tr/phi` (the note, Corollaries 4.3 and 4.4). It is renamed `trace_over_degree` (the proposal keeps the old name with the new meaning), and its unreduced `u64` sum is fixed.
+4. **The fine projection's dual lift is wrong for this ring.** The code lifts `J_batched` with `conj(j)`, which relies on `ct(conj(a) b) = <cf a, cf b>`. That identity fails here *(checked)*: `ct(a conj(b)) = <a, b> + sum_{i<48} a_i b_{i+48}` (also in the proposal, Section 2.1).
+   - The correct lift is `j_hat = conj(M j)`. `M` mixes each coefficient pair `(i, i+48)` with `(4/3) [[1, -1/2], [-1/2, 1]]`, so that `Tr(j_hat x)/phi = <j, x>` *(checked)*.
+   - Equivalently, the trace-dual basis is `b_i^v = (4 / (3 phi)) (X^{-i} - X^{-(i +- 48)} / 2)`. The proposal states the requirement ("J is lifted through the trace-dual basis", Section 2.3) but its PR list and code inventory do not include the change.
 5. **Choice of the challenge field.** Challenges are sampled on the diagonal of the homogenized slots (`hash.rs` `sample_ring_element_ntt_slots_same_*`, `arithmetic.rs` `field_to_ring_element_into`).
-   - The `eta_j` fall into two cubic-residue classes, `j = 1` and `j = 2 mod 3`, of equal size *(checked)*. Half the slots therefore need the inverted homogenization `X -> c Y^{-1}`, which swaps parts 1 and 2, as `INVERTED_SLOTS` does for degree 4.
-   - For each slot, exactly one of the three cube-root constants `c_j` maps `tau_j` to a common target *(checked)*. With that choice the diagonal is `Z_p[tau]`, and `conj(r) = r` for every challenge.
-6. **The challenges are fixed weight, not uniform ternary.** The note's non-invertibility estimate (Claim 4.3) assumes uniform ternary coefficients, but `short_challenge.rs` samples `TAU` entries equal to `+-1`. `tau` must be chosen for invertibility of differences, not only for the size of the challenge set. Estimates:
+   - The `eta_j` fall into two cubic-residue classes of 16 slots each *(checked)*. Half the slots therefore need the inverted homogenization `X -> c Y^{-1}`, which swaps parts 1 and 2, as `INVERTED_SLOTS` does for degree 4. The proposal has the same two classes.
+   - For each slot, exactly one of the three cube-root constants maps `tau` to a common target *(checked)*. With that choice the diagonal is `Z_p[tau]`, and `conj(r) = r` for every field challenge.
+6. **The challenges are fixed weight, not uniform ternary.** The note's non-invertibility estimate (Claim 5.4) assumes uniform ternary coefficients, but `short_challenge.rs` samples `TAU` entries equal to `+-1`, so `tau` must be chosen for invertibility of differences as well as for the size of the challenge set. The proposal says only "checked, fine". Estimates at `phi = 96`:
 
-   | phi | tau | log2 of the set size | log2 Pr[difference non-invertible], heuristic range |
-   |---|---|---|---|
-   | 96 | 40 | 130.5 | [-141, -117] |
-   | 96 | 48 | 140.4 | [-150, -132] |
-   | 192 | 26 | 132.3 | [-117, -83] (too weak) |
-   | 192 | 32 | 153.1 | [-131, -103] |
-   | 192 | 48 | 199.9 | [-166, -156] |
+   | tau | log2 of the set size | log2 Pr[difference non-invertible], heuristic range |
+   |---|---|---|
+   | 39 | 128.95 | [-139, -115] |
+   | 40 | 130.47 | [-140.7, -117.1] |
+   | 48 | 140.4 | [-150, -132] |
 
-   The range comes from how much probability mass the non-zero lattice points carry, the same heuristic as in the note.
-7. **Operator norm.** `short_challenge.rs` evaluates at the odd powers of a `2N`-th root with a power-of-two FFT. For this ring it must instead evaluate at `zeta_m^j` with `gcd(j, m) = 1`, one `j` per conjugate pair, using a phase table of length `m`. The norm bound then becomes `gamma_C = sqrt(3) * bound` (the note, Lemma 3.8).
+   The range comes from how much probability mass the non-zero lattice points carry, the same heuristic as in the note. With rejection at 12.4, `tau = 40` keeps `2^128.86` challenges for 3.04 attempts.
+7. **Operator norm.** `short_challenge.rs` evaluated at the odd powers of a `2N`-th root with a power-of-two FFT. For this ring it evaluates at `zeta_288^j` with `gcd(j, 288) = 1`, one `j` per conjugate pair, using a phase table of length 288. The bound on the coefficient operator norm is then `gamma_C = sqrt(3) * bound` (the note, Lemma 4.7; the proposal, Section 2.4).
+8. **The no-wrap guard is `(3/2) r' beta'^2 < p/2`, not `3 r' beta'^2 < p/2`.** The note's eq. (4) bounds every coefficient of `<w*, conj w*>`, which is more than the check needs. The verifier reads only `Tr(v)/phi`. For an integer vector, `I = Tr(<w*, conj w*>)/phi` is the sum over the entries `x` of `w*` of `||x||^2 + sum_{i<48} x_i x_{i+48}`, an integer (the note, Corollary 4.4) in `[||w*||^2/2, (3/2) ||w*||^2]` (Proposition 4.2), and `I = Tr(v)/phi mod p`. So `(3/2) r' beta'^2 < p/2` suffices: one bit better, and the proposal's "lemma to write" is Corollary 4.4 with Proposition 4.2. It fails for other conductors (the proposal's `f = 15`), which is why the paper keeps `f_hat`.
+9. **The projection image must tile power-of-two shapes.** The image is chunked by `projection_height / DEGREE`, its height is a power of two (`project_fine.rs:495-533`), commitment placements must be power-of-two sized (`config_generator.rs:621`, and the "a slice must be dyadic" check in `commitment.rs:224`), and the consistency step multiplies one ring element `e`, built from `DEGREE.ilog2()` layers, by the scalar tensor `c_2 (x) c_0 (x) e_0` (`sumchecks/loader.rs` about 182-215). The proposal's 3-element image with a `2^8` tensor over positions 0-255 gives 3 different ring multipliers per chunk, which is not a power-of-two axis, so it almost certainly needs padding to 4 elements. At 4 elements, 384 JL rows cost the same image size as 256 and give stronger JL constants. If the padding coefficients ever carry zero batching weight, the lemma must cover them: they are unconstrained, and only the bound `||x||^2 <= 2 Tr/phi` keeps them harmless.
+10. **Byte-identity on the existing rings holds with overwhelming probability, not by construction**, for three changes of PR 3 (Phase 1): Fiat-Shamir sampling rejects words at or above `2^64 - (2^64 mod q)` (probability `2^-38.6` per word on d2, `2^-41.2` on d4); verifier radix-weight shifts `>= log2 q` are reduced mod `q`; `expand_combination` no longer caps all-scalar combinations at 32 components. The proof-hash check is what establishes byte-identity for the PCS sets.
 
-## Phases
+## The PR stack
 
-### Phase 0: baseline and guardrails
+The proposal's 7 stacked PRs (its Section 5). The phases this plan was written in map onto them as follows.
 
-- Record the test-suite runtime and the outcomes on the default ring. Record the proof size of `p-26` as a golden value.
-- Turn the scripts in `goldilocks-note/port-checks/` into reference-vector generators: slot products, conjugation, trace, dual basis, homogenization and Goldilocks scalar operations. Have them emit vectors that Rust tests can load.
+| PR | Content | Former phase | Status |
+|---|---|---|---|
+| 1. Ring spec | Explicit ring kind (`family = "trinomial"`), `build.rs` accepts `N = 96`, a non-power-of-two degree and `p > 2^63`; emitted `RingFamily`, `HALF_DEGREE`, `SLOT_DEGREE = 3`, `NUM_SLOTS = 32`. No behaviour change. | 2 (`build.rs`, `ring.rs`, `main.rs`) | done |
+| 2. Goldilocks backend | `incomplete-rexl` only: field (`goldilocks.rs`), wide-modulus fixes in `number_theory.rs` and the eltwise dispatch, trinomial NTT, cubic slot multiply, dot products, scalar code, tests against the naive product mod `(Phi_288, p)` and the reference vectors. The main crate is untouched. | 1 and 2 (`incomplete-rexl`) | done, scalar |
+| 3. Ring algebra | Conjugation and the trace readout; degree-3 `FieldExtension` with homogenisation; 64-bit wire format and rejection sampling in the transcript; the `MOD_Q as i64` / `MOD_Q * 4` audit; exact `i128` kernels outside `LAZY_REDUCTION`; ring-level identity tests. | 1 and 2 (main crate) | done |
+| 4. Shapes | The challenge sampler at the 288th roots; the fine-projection image shape (`n_rp`, Finding 9), the `conj(M j)` lift (Finding 4), the placement of the `c_1` tensor and `e_1`. | 3, and 4 (projection) | sampler done |
+| 5. Norm accounting | `gamma_C = sqrt(3) * 12.4` (done in `debug_hardness.rs`); the canonical exact norm `Tr(v)/phi <= (3/2) beta^2` and the extracted `sqrt(3) beta`; the guard `(3/2) r' beta'^2 < p/2` (Finding 8); `Tr(r_i) = 0` rather than `ct(r_i) = 0` on the prover side; the estimator with `q = p`, `gamma_C` and the `sqrt(3)` extraction. | 3 (`gamma_C`), 4 (norm check), 5 (estimator) | `gamma_C` done |
+| 6. Instantiation | `rings/goldilocks_k5.toml` and its instantiation module with `p-26` and `p-28`; the `NB_*` tables from `--features calibration`; end-to-end verification; `debug-hardness`; numbers against d4. Lifts the `compile_error!` in `src/main.rs` for the plain chain. | 5 | spec file done |
+| 7. Commitment kernel | Measure the direct Goldilocks dot product against a port of the VNNI CRT kernel (#113, removed in #157) on the `p-28` root shape and keep the faster. | new | to do |
 
-### Phase 1: 64-bit modular arithmetic
+After the stack, outside the proposal:
 
-- **`incomplete-rexl`.**
-  - A Goldilocks scalar layer: `u128` product reduction, add/sub with carry handling, inverse without `i64`.
-  - `eltwise_{add,sub,mult,fma,reduce}` paths for `p`, dispatched when `modulus == p`.
-  - Fix the overflows in `number_theory.rs`: `add_uint_mod`, `sub_uint_mod`, `inverse_mod`, and the `q < 2^62` asserts.
-- **Main crate.** Make every helper correct for any `q < 2^64`:
-  - Remove every `MOD_Q as i64`: `decomposition.rs:142`, `arithmetic.rs:101, 329, 338`, `wire.rs:685`, and the tests.
-  - Rework the consumers of `HALF_WAY_MOD_Q` (`project_fine.rs`, `helpers.rs`, `projection_matrix.rs`). They should accumulate exactly in `i64`/`i128` over the short inputs and reduce once.
-  - Make Fiat-Shamir sampling uniform by rejection: `hash.rs:104, 160-192`.
-  - Fix the remaining overflows:
-    - the unreduced sum at `verifier.rs:732`;
-    - `constant_term_from_incomplete_ntt`;
-    - the radix weights `1u64 << (bl * i)` in `builder_verifier.rs:207`;
-    - `wire.rs` (`SYMBOLS = 56`, the 6-bit model bounds).
+- **Goldilocks evaluation claims** (the note, Section 6; former Phase 6). An `F_{p^3}` evaluation point costs one ring element and one left-right constraint through the functional `L_{z_lo}`, with the outer model `F_p[Z]/(Z^3 - 2)`. Waiting on the maintainer: the proposal packs 64 field elements per ring element as 4 digits of 16 bits (2/3 fill), the note 3 digits of 22 bits at full fill (Question 2).
+- **Performance** (former Phase 7): AVX-512 IFMA kernels for the NTT, the slot product and the dot products, shifts for the power-of-2 twiddles, Karatsuba dot products flushed every 2048 terms, vectorised sumcheck field code (the proposal, Section 2.5). No NEON. Re-bench against `benches/comparison_ckks.md`.
 
-### Phase 2: the ring
+### Code sites still to change (PRs 4 and 5)
 
-- **`build.rs`.** Add a ring spec field for the cyclotomic family and emit a field/ring `cfg`. For this family emit `DEGREE = 3 * 2^k`, `SLOT_DEGREE = 3` and `NUM_SLOTS = 2^k`, and drop the power-of-two and `2N >> v2(q-1)` rules.
-- **NTT.** Build it from Finding 2.
-- **Slot arithmetic.** A cubic slot product (6 multiplications with Karatsuba, plus 2 by `eta_j`) and slot dot products.
-- **Homogenization and the challenge field.**
-  - Homogenization with inverted slots and the `tau`-aligned cube roots (Finding 5).
-  - Degree-3 multiplication and inverse for `FieldExtension`. Today the `else` branch silently computes a degree-2 product.
-- **Conjugation and trace.**
-  - Conjugation reference with `X^{-1} = X^{n-1} - X^{2n-1}`. The NTT-domain transform derivation carries over.
-  - The naive multiplication oracle.
-  - `trace_over_degree`.
-- **Slot-degree dispatch.** Make every `match SLOT_DEGREE { 2 => .., _ => degree 4 }` and every `SLOT_DEGREE.ilog2()` transpose explicit: `helpers.rs:552, 574`, `project_fine.rs:353`.
+Merged from this plan's notes and the proposal's inventory (its Section 2.7). The proposal's line numbers are on `main` (`9023459`); the others are on this branch.
 
-### Phase 3: fold challenges
+- **`projection_height / DEGREE`** (16 sites, rounds 256/96 down to 2), on `main`: `project_fine.rs:36, 154, 467-484, 802, 1017`; `sumchecks/builder.rs:486, 540`; `sumchecks/builder_verifier.rs:791, 847`; `intermediate_sumchecks/builder.rs:90`; `intermediate_sumchecks/builder_verifier.rs:96`; `verifier.rs:350, 371, 714, 720`. On this branch the executor tests overrun at `project_fine.rs:552`.
+- **The `c_1` tensor split by `DEGREE.ilog2()`**, on `main`: `sumchecks/loader.rs:177-212`, `sumchecks/loader_verifier.rs:148-156`, `project_fine.rs:755-764`. Also `project_fine.rs:1318` and `params.rs:110, 131` on this branch. With `e_1` uniform in `Z_p^phi`, the verifier computes it in `O(phi)` and the error per row is `(1 + log(.))/p`.
+- **The dual lift** (Finding 4): `compute_j_batched_exact` and the call sites `project_fine.rs:142, 327`, the AVX-512 reversal at `project_fine.rs:335-375`, `loader.rs:212` (`e.conjugate_in_place()`), `loader_verifier.rs:158`.
+- **`trace_over_degree` call sites**, none of which needs the constant term rather than `Tr/phi`: the three norm claims in `sumchecks/runner_verifier.rs`, the `Tr(r_i) = 0` check on `constant_term_claims` there, the intermediate norm claim in `intermediate_sumchecks/runner_verifier.rs`, and the fine-projection consistency in `parties/verifier.rs:399, 741`. The last holds at `p` only with the `conj(M j)` lift.
+- **Shape checks:** `builder.rs:486-548`, `verifier.rs:564`, and the `NOF_BATCHES == 2` assert.
+- **Norm accounting:** the verifier's exact-norm bound, the new no-wrap guard, `estimator.rs:41-52` (on `main`: plain SIS with `n = rank * 96`, `q = p`, coefficient norm).
+- **Tests reading `.v[0]` of conjugate products** (`project_fine.rs` tests at about lines 1114 and 1370) rely on `ct(conj(a) b) = <cf a, cf b>` and must read `Tr/phi` or use the lift.
 
-- Compute the operator norm in the canonical embedding with a length-`m` phase table (Finding 7).
-- Calibrate `tau` from both the size of the challenge set and the invertibility estimate (Finding 6), and set `op_norm_bound`.
-- Use `gamma_C = sqrt(3) * bound` in the norm schedule and in `debug_hardness.rs`.
+## Alignment with the proposal
 
-### Phase 4: protocol
+Same in both: the ring, its slots and the NTT strategy (no radix-3 layer); the trace readout `Tr/N = a_0 + a_48/2`; the norm check `Tr(v)/N <= 1.5 beta^2` and the `sqrt(3)` extraction; the evaluation set of the operator norm and `gamma_C = sqrt(3) * bound`; the two homogenization classes; a dedicated backend; selection through `ROKOKO_RING`; the PR order.
 
-- **Fine projection.**
-  - Use the `conj(M j)` lift.
-  - Set `n_rp = 384` and fix the shape checks: `builder.rs:486-548`, `verifier.rs:564`.
-  - Replace the `e_1 = DEGREE.ilog2()` tensor layers by a uniform `e_1 in Z_p^phi`. The verifier computes it in `O(phi)`, and the error per row is `(1 + log(.))/p`.
-  - Use `n_bat = 2`, and relax the `NOF_BATCHES == 2` assert.
-- **Norm check.**
-  - Verifier bound: `Tr(v)/phi <= (3/2) beta^2`. The extracted bound becomes `sqrt(3) beta`.
-  - Add an explicit guard `3 r' beta'^2 < p/2`. Nothing in the code enforces it today.
-- **SNARK layer.** The norm claims (`snark/mod.rs:487`, `examples/claims.rs:75`) now measure the canonical norm divided by `phi`. Update the docs and `test_norm_claim_roundtrip`.
+Adopted from the proposal: conductor 288 only; `tau = 40` and bound 12.4; the guard constant 1.5; the PCS-only scope; byte-identity checked per PR; the PR stack; no NEON; the commitment-kernel PR; its code inventory.
 
-### Phase 5: parameters
+Kept from this plan, to raise with the maintainer:
 
-- Add `rings/goldilocks_k5.toml`, `rings/goldilocks_k6.toml` and `src/instantiation_goldilocks.rs`, with new digit sizes and ranks.
-- Regenerate the `NB_*` tables with `--features calibration`.
-- Run the estimator with `q = p` and the `sqrt(3)` extraction factor.
-
-### Phase 6: Goldilocks evaluation layer (the note, Section 5)
-
-- Pack each Goldilocks coefficient as 3 digits of 22 bits.
-- Implement the functional `L_{z_lo}`, so that an `F_{p^3}` evaluation claim costs one ring element and one left-right constraint.
-- Convert to the outer protocol's model `F_p[Z]/(Z^3 - 2)`.
-
-### Phase 7: performance
-
-- AVX-512, AVX2 and NEON Goldilocks kernels for the NTT, the slot product and the dot products.
-- Re-bench against `benches/comparison_ckks.md`.
+1. **Projection shape** (Finding 9). How do 3-element image chunks fit the power-of-two placements and the single-`e` consistency step? This plan keeps `n_rp = 384` (4 elements) provisionally.
+2. **Packing and evaluation claims.** Why 4 digits of 16 bits at 2/3 fill rather than 3 of 22 bits, or 6 of 11 bits (same `2^25` ring elements for `2^29` values, full fill)? The proposal's own estimate charges 1.5x for the empty coefficients. And how are `F_{p^3}` evaluation points handled? The note's Section 6 has a mechanism (`L_{z_lo}`).
+3. **The dual lift and `Tr(r_i) = 0`** are missing from the proposal's PR list (Finding 4, and the `trace_over_degree` sites above).
+4. **Calibration of the challenge bound.** Under the rule that reproduces the existing rings (smallest bound keeping `2^128` after rejection), `tau = 40` would give 11.8 at 5.44 attempts; 12.4 trades 4.6% of `gamma_C` for about 3 attempts. Which rule does the proposal use? This plan adopts 12.4.
+5. **Challenge-field constants** (Finding 5): this plan keeps the `tau`-aligned cube roots, which make `conj(r) = r`.
+6. **VNNI kernel margin.** If coefficients of `A w` reach `2^94`, a signed CRT needs a product above `2^95`: 8 primes, not 7. The listed "16-bit primes" are at most 14 bits.
+7. **Smaller corrections.** `||x||_inf <= (4/pi) ||sigma(x)||_inf` holds but the exact constant is `2/sqrt(3)`; the PCS throughput estimate uses a 70 ns kernel where the measured one gives about 38.5 s instead of 34.7 s; the proof-size discussion omits the larger `F_{p^3}` sumcheck messages (the note, Section 6).
 
 ## Testing
 
-- **Reference vectors.** Check every ring primitive against the Python vectors.
-- **Round trips.** Run the round trips in `executor.rs` and `full_chain_verifies` on both families.
+- **Reference vectors.** Every ring primitive against the Python vectors (`gen_vectors.py`).
+- **Byte-identity.** For every PR, the proof hashes of `p-26` and `p-28` on d2 and d4 equal those of `main`.
+- **Round trips.** The round trips in `executor.rs` and `full_chain_verifies` on both families.
 - **Negative tests.**
   - A wrong fine-projection lift must be rejected.
   - An over-norm witness must be rejected.
 - **Invariants.**
-  - `conj(r) == r` holds for challenges.
+  - `conj(r) == r` holds for field challenges.
   - `Tr(j_hat x)/phi == <j, x>` holds on random `x`.
+  - Accepted fold challenges have coefficient operator norm at most `gamma_C`.
 
 ## Items to fold back into the note
 
-- Finding 6: the estimate for fixed-weight challenges.
+- Finding 8: the guard `(3/2) r' beta'^2 < p/2`, replacing eq. (4), with its proof from Corollary 4.4 and Proposition 4.2.
+- Finding 6: the estimate for fixed-weight challenges, and the chosen `tau = 40`.
 - Finding 5: `conj(r) = r` once the diagonal is `Z_p[tau]`.
 - Finding 4: the explicit trace-dual basis.
 - Finding 2: the NTT needs no radix-3 layer.
+- The measured `||c||_op / ||sigma(c)||_inf` range for fixed-weight challenges (1.08-1.66, mean 1.35).
 
 ## Progress
+
+The log below is in the order the work was done (Phases 0-3). Phases 0-2 covered `k = 5` and `k = 6`; only `k = 5` is upstreamed (see Scope).
 
 ### Phase 0: baseline (done)
 
@@ -322,7 +320,7 @@ Results: `incomplete-rexl` 9 unit + 6 Goldilocks + 27 integration pass in releas
   - `incomplete_ntt_reduces_on_load`, through `RingElement::all(u64::MAX)` and `constant(p + 5)`.
 - Adapted tests. Their behaviour on the existing rings is unchanged.
   - `test_constant_term_from_incomplete_ntt` became `test_trace_over_degree`.
-  - `test_norm_squared_via_conjugation` expects `sum x_i^2 + sum_{i<n} x_i x_{i+n}` for the trinomial family (the note, Corollary 3.5).
+  - `test_norm_squared_via_conjugation` expects `sum x_i^2 + sum_{i<n} x_i x_{i+n}` for the trinomial family (the note, Corollary 4.4).
   - `decomposition::test_random_mod_q` takes its digit count from the bit length of `q`, `ceil(bits(q) / 13)`: 4 for the 50-bit rings, as before, and 5 at `p`.
   - `hash::rejected_words_are_replaced_in_order` runs its second half at a 50-bit modulus when `MOD_Q = p`, whose rejection bound is `p` itself.
   - `project_fine::reduce_conjugate_matches_ntt_then_conjugate` returns early outside `LAZY_REDUCTION`: it tests a lazy-only kernel on inputs biased by `HALF_WAY_MOD_Q`, which is 0 at `p`.
@@ -378,7 +376,7 @@ No test is ignored or `cfg`-gated to hide a failure. The only `cfg`-gated tests 
 **Notes for Phase 4.**
 
 - `trace_over_degree` call sites. None of them needs the constant term rather than `Tr/phi`:
-  - `sumchecks/runner_verifier.rs`: the three norm claims (`norm_claim`, `most_inner_norm_claim`, `projection_norm_claim`), all of the form `<w, conj w>`, where `Tr/phi` is the right functional (Corollary 3.5);
+  - `sumchecks/runner_verifier.rs`: the three norm claims (`norm_claim`, `most_inner_norm_claim`, `projection_norm_claim`), all of the form `<w, conj w>`, where `Tr/phi` is the right functional (the note, Corollary 4.4);
   - `sumchecks/runner_verifier.rs`: the `Tr(r_i) = 0` check on `constant_term_claims`. Phase 4 must make sure the prover's `r_i` satisfy `Tr = 0` rather than `ct = 0`;
   - `intermediate_sumchecks/runner_verifier.rs`: the intermediate norm claim;
   - `parties/verifier.rs:399` and `:741`, the fine-projection constant-term consistency. It checks `Tr/phi(batched image) = sum c_1 . projection_image_ct`, which holds at `p` only with the `conj(M j)` lift (Finding 4). With today's `conj(j)` lift (`compute_j_batched_exact`) it fails.
@@ -408,9 +406,9 @@ A read-only review of the Phase 2 diff found no high- or medium-severity bug.
   - `op_norm` (the dense reference) evaluates at every `EVAL_EXPONENTS` entry through the table, with the index `(j k) mod m` computed directly rather than stepped.
   - `op_norm_direct` uses `cos` and `sin` at all `phi` exponents `j < m` that are odd and not multiples of 3, without the table or the `gcd` filter.
 - The power-of-two path does not change. The phase angle keeps its old expression `pi t / N`, so the table is bit-identical, and the AVX-512 kernel and `PHASE_ROWS` are textually unchanged. `op_norm_sq_sparse` returns to the trinomial path before the `#[cfg(avx512f)]` dispatch, so trinomial builds never reach the kernel's `PHASE_MASK` indexing. The fingerprint stream is still `710f97b1…` on the default ring, and `422675347b…` on `n128_d4`, the same value as a `HEAD` build in a temporary worktree. `p-26` is unchanged.
-- New `GAMMA_C`, the bound on the coefficient-embedding operator norm of an accepted challenge: `T_OP_NORM_BOUND` for `X^N + 1`, where `||c||_op = ||sigma(c)||_inf`, and `sqrt(3) * T_OP_NORM_BOUND` for the trinomial family (the note, Lemma 3.8).
+- New `GAMMA_C`, the bound on the coefficient-embedding operator norm of an accepted challenge: `T_OP_NORM_BOUND` for `X^N + 1`, where `||c||_op = ||sigma(c)||_inf`, and `sqrt(3) * T_OP_NORM_BOUND` for the trinomial family (the note, Lemma 4.7).
 
-**`gamma_C` consumers.** `T_OP_NORM_BOUND` is used only by `debug_hardness.rs`, in its two live extracted-witness bounds (`check_sumcheck_round`, `check_simple_round`) and in one commented-out copy. All three now use `GAMMA_C`. The other users are the sampler itself and the `n128_d4` instantiation's spec assert. Nothing else consumes the challenge norm: the `NB_*` norm schedule is measured, not derived from it. The module builds with `--features debug-hardness` on the default ring and at `k = 5`. The other `sqrt(3)`, the extracted norm-check bound `sqrt(3) beta` (the note, Lemma 9 over `R_p`), is a separate Phase 4 item and is not in `debug_hardness.rs` yet.
+**`gamma_C` consumers.** `T_OP_NORM_BOUND` is used only by `debug_hardness.rs`, in its two live extracted-witness bounds (`check_sumcheck_round`, `check_simple_round`) and in one commented-out copy. All three now use `GAMMA_C`. The other users are the sampler itself and the `n128_d4` instantiation's spec assert. Nothing else consumes the challenge norm: the `NB_*` norm schedule is measured, not derived from it. The module builds with `--features debug-hardness` on the default ring and at `k = 5`. The other `sqrt(3)`, the extracted norm-check bound `sqrt(3) beta` (the note, Section 5.3, "Norm check"), is a separate Phase 4 item and is not in `debug_hardness.rs` yet.
 
 **Calibration of `tau` and `op_norm_bound`.**
 
@@ -542,3 +540,55 @@ Decisions taken by the user:
 - `challenge_stream_fingerprint` stays failing, as on `main`; it is not part of the port.
 
 Left as is: the bounds-checked indexing in `op_norm_sq_sparse_trinomial` (not benchmarked; Phase 7), and the test name `fft_op_norm_matches_direct_on_fixed_vector`, which no longer uses an FFT on the trinomial family.
+
+### Alignment with the proposal (after Phase 3)
+
+The plan above was rewritten around the maintainer's proposal, with the user's decisions: conductor 288 only, the guard constant 1.5, `n_rp = 384` kept provisional, `tau = 40`, SNARK mode out of scope, and a proof-hash check with the commits re-split into the proposal's PR stack. These supersede the Phase 3 decision to keep `tau = 39`.
+
+**Changes.**
+
+- `build.rs` accepts the trinomial family only at degree 96 (`TRINOMIAL_DEGREE`). `rings/goldilocks_k6.toml` is deleted, and the main crate's ring-vector test drops its `k = 6` arm. `incomplete-rexl` is unchanged: `TrinomialSlotRing` stays generic in `k`, and `tests/trinomial.rs` still checks `k = 5` and `k = 6` against both vector files.
+- `rings/goldilocks_k5.toml`: `tau = 40`, `op_norm_bound = 12.4`.
+  - `C(96, 40) * 2^40 = 2^130.47` challenges before rejection.
+  - The calibration row at 12.4 (`10^6` attempts) gives an acceptance rate of 0.3284, so 3.04 attempts, and `2^128.86` challenges after rejection. Measured directly on the sampler: 3.053 attempts over `2 * 10^5` challenges.
+  - `gamma_C = sqrt(3) * 12.4 = 21.477`.
+  - `Pr[non-invertible difference]` in `[2^-140.72, 2^-117.14]`.
+  - `||c||_op / ||sigma(c)||_inf` reaches at most 1.613 in `challenges_have_operator_norm_at_most_gamma_c`; the 300-sample calibration row gives 1.131 to 1.649, mean 1.354.
+- SNARK mode is compiled out for the trinomial family. `pub mod snark` is under `cfg(not(rokoko_family = "trinomial"))`, and `--features snark` is a `compile_error!` there. Nothing outside SNARK mode used the module, apart from three SNARK-only pieces that are gated with it: `executor::execute_snark`, `wire::initial_{to,from}_bytes`, and `examples/claims.rs`, which is a `compile_error!` at `p`. `Role::WitnessEval` is kept, so the wire header has the same 16 models in every family. The default rings build and test exactly as before, with and without `--features snark`.
+- **Proof-hash check**, `scripts/proof-hash.sh`.
+  - `ROKOKO_PROOF_OUT=<path>` makes `executor::run` write the proof's wire bytes once they are serialised. This is the only change to the executor, kept as `scripts/proof-hash.patch`.
+  - The script builds the base (by default the merge base with `origin/main`, `9023459`) in a temporary worktree with that patch applied, and nothing else changed. It builds the working tree too, each ring into its own target directory.
+  - It runs each set twice per side, compares SHA-256 hashes, and exits 0 only if they all agree.
+  - Usage: `./scripts/proof-hash.sh [--base=REV] [--rings=...] [--sets=p-26,p-28] [--runs=2] [--dir=PATH]`. About 8 minutes with the builds.
+
+**Proof hashes against `9023459`.** Every run on both sides gave the same bytes, so proof generation is deterministic and the port leaves d2 and d4 byte-identical at the PCS sets.
+
+| ring | set | SHA-256 (both sides) | bytes |
+|---|---|---|---|
+| d2 | `p-26` | `9d25e7ac77bc4d31…` | 114760 |
+| d2 | `p-28` | `1492186a59a2f8e2…` | 114824 |
+| d4 | `p-26` | `81483ff62903915d…` | 132165 |
+| d4 | `p-28` | `9029df17a356e192…` | 132189 |
+
+On the three changes of Finding 10, probed on these four runs:
+- no Fiat-Shamir word was rejected;
+- the verifier's radix weights (`load_combiner_evaluation_data`) are reached only by intermediate rounds, which these chains do not run;
+- `expand_combination` is SNARK-only.
+
+The hook hashes the round proof's wire bytes. The commitment enters them through the transcript, but is not compared byte for byte.
+
+**Results.**
+
+| Command | Result |
+|---|---|
+| `incomplete-rexl`, `cargo +nightly test` | 9 unit + 6 Goldilocks + 27 integration + 8 trinomial pass |
+| `cargo +nightly test --lib` (debug), default ring | 187 pass, 1 fail (`challenge_stream_fingerprint`, as on `main`) |
+| `ROKOKO_RING=rings/n128_d4.toml cargo +nightly test --release --lib` | 187 pass, 1 fail (the same) |
+| `ROKOKO_RING=rings/goldilocks_k5.toml cargo +nightly test --lib` (debug) | 165 pass, 6 fail |
+| `cargo +nightly run --release -- p-26` | `100.3199462890625 KB` and `112.0703125 KB` |
+| `cargo +nightly build`, with and without `--features snark`, default ring | builds |
+| `--features snark` and `cargo build --examples` at `k = 5` | stop on the intended `compile_error!` |
+
+At `p` the count drops from 195 to 171 because the 24 `snark` tests no longer exist there; they still run on d2 and d4. Among them are the two that failed at `p` (`test_conj_segment_ct_zero_roundtrip`, `test_norm_claim_roundtrip`). The 6 failures are `challenge_stream_fingerprint` and the 5 PR 4 tests: `project_fine` `test_batch_projection`, `test_const_term_relation_to_prove` and `exact_projection_paths_match_the_lazy_kernels`, and `executor` `three_openings_round_trip` and `three_decomposition_chunks_round_trip`.
+
+**Unverified.** The x86 paths, as before; none of these edits is arch-specific. The full `cargo test --release` with the binary's tests was not re-run.

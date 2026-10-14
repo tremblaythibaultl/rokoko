@@ -16,6 +16,7 @@ use crate::common::ring_arithmetic::{FieldExtension, Representation, RingElement
 use crate::protocol::config::{
     IntermediateRoundProof, NextRoundCommitment, RoundProof, SimpleRoundProof, SumcheckRoundProof,
 };
+#[cfg(not(rokoko_family = "trinomial"))]
 use crate::protocol::snark::ClaimsProof;
 use crate::protocol::sumcheck_utils::polynomial::Polynomial;
 
@@ -55,6 +56,8 @@ enum Role {
     ProjectionCt,
     BatchedProjection,
     OpeningRhs,
+    // SNARK mode only; kept in every family so that the header always has `ROLES` models.
+    #[cfg_attr(rokoko_family = "trinomial", allow(dead_code))]
     WitnessEval,
 }
 
@@ -1040,6 +1043,7 @@ fn representation(tag: u64) -> Result<Representation, WireError> {
     })
 }
 
+#[cfg(not(rokoko_family = "trinomial"))]
 pub fn initial_to_bytes(proof: &ClaimsProof) -> Vec<u8> {
     let mut encoder = Encoder::new();
     encoder.polys(&proof.polys);
@@ -1048,6 +1052,7 @@ pub fn initial_to_bytes(proof: &ClaimsProof) -> Vec<u8> {
     encoder.finish()
 }
 
+#[cfg(not(rokoko_family = "trinomial"))]
 pub fn initial_from_bytes(bytes: &[u8]) -> Result<ClaimsProof, WireError> {
     let mut decoder = Decoder::new(bytes)?;
     Ok(ClaimsProof {

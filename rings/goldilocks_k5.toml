@@ -3,7 +3,7 @@
 family = "trinomial"
 degree = 96
 mod_q = 18446744069414584321 # 2^64 - 2^32 + 1
-# The smallest tau with 2^128 challenges and invertible differences (Finding 6), then the
-# smallest bound on ||sigma(c)||_inf that keeps 2^128 after rejection, as for rings/*_d4.toml.
-tau = 39 # C(96,39) * 2^39 = 2^128.95 challenges before rejection; Pr[non-invertible difference] in [2^-139.3, 2^-115.0]
-op_norm_bound = 13.0 # about 1.90 sampling attempts per challenge, 2^128.03 after rejection; gamma_C = sqrt(3) * 13.0 = 22.5
+# The operating point of the conductor-288 proposal: tau = 40, with invertible differences (Finding
+# 6), and a bound on ||sigma(c)||_inf at about 3 attempts, as for rings/n128_d4.toml.
+tau = 40 # C(96,40) * 2^40 = 2^130.47 challenges before rejection; Pr[non-invertible difference] in [2^-140.7, 2^-117.1]
+op_norm_bound = 12.4 # about 3.04 sampling attempts per challenge, 2^128.86 after rejection; gamma_C = sqrt(3) * 12.4 = 21.5

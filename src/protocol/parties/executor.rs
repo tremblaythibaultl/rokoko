@@ -119,6 +119,10 @@ fn run(
         serialise.as_secs_f64() * 1e3,
         deserialise.as_secs_f64() * 1e3
     );
+    // The wire bytes, for scripts/proof-hash.sh; the proof is complete by now.
+    if let Some(path) = std::env::var_os("ROKOKO_PROOF_OUT") {
+        std::fs::write(&path, &bytes).expect("ROKOKO_PROOF_OUT must be a writable path");
+    }
 
     let start = std::time::Instant::now();
     let mut verifier_boundary = None;
@@ -200,7 +204,8 @@ fn check_prover_claims_match_witness(
 }
 
 /// SNARK mode: prove user-supplied sumcheck claims about a committed witness,
-/// then run the PCS chain on the resulting evaluation claims.
+/// then run the PCS chain on the resulting evaluation claims. Not ported to the trinomial family.
+#[cfg(not(rokoko_family = "trinomial"))]
 pub fn execute_snark(inst: &Instantiation) {
     use crate::common::{
         hash::HashWrapper,
