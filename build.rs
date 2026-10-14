@@ -17,7 +17,28 @@ fn main() {
     }
 }
 
+/// The cyclotomic family of the ring spec's `family` field.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Family {
+    /// `Z_q[X]/(X^N + 1)`, `N` a power of two (conductor `2N`): the default.
+    PowerOfTwo,
+    /// `Z_p[X]/(X^{2n} - X^n + 1)`, `n = 3 * 2^{k-1}`, of conductor `9 * 2^k` and degree
+    /// `phi = 3 * 2^k`, over the Goldilocks prime `p = 2^64 - 2^32 + 1`. Only `k = 5` (degree 96,
+    /// conductor 288) is supported.
+    Trinomial,
+}
+
+impl Family {
+    fn name(self) -> &'static str {
+        match self {
+            Family::PowerOfTwo => "power_of_two",
+            Family::Trinomial => "trinomial",
+        }
+    }
+}
+
 struct RingSpec {
+    family: Family,
     degree: u64,
     mod_q: u64,
     tau: u64,
@@ -34,6 +55,7 @@ fn emit_ring() {
     };
     println!("cargo:rerun-if-changed={}", path.display());
     println!("cargo::rustc-check-cfg=cfg(rokoko_ring, values(any()))");
+    println!("cargo::rustc-check-cfg=cfg(rokoko_family, values(\"power_of_two\", \"trinomial\"))");
     if let Some(stem) = path.file_stem() {
         println!("cargo::rustc-cfg=rokoko_ring={:?}", stem.to_string_lossy());
     }
@@ -43,14 +65,29 @@ fn emit_ring() {
     if let Err(e) = validate_ring(&spec) {
         fail(&path, &e);
     }
+    println!("cargo::rustc-cfg=rokoko_family={:?}", spec.family.name());
     let out = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
-    let slot_degree = slot_degree(spec.degree, spec.mod_q);
+    let slot_degree = match spec.family {
+        Family::PowerOfTwo => slot_degree(spec.degree, spec.mod_q),
+        Family::Trinomial => 3,
+    };
+    let family = match spec.family {
+        Family::PowerOfTwo => "PowerOfTwo",
+        Family::Trinomial => "Trinomial",
+    };
+    // `HALF_DEGREE` is `N/2` for `X^N + 1` and `n = phi/2` for `X^{2n} - X^n + 1`.
     std::fs::write(
         out.join("ring.rs"),
         format!(
-            "pub const DEGREE: usize = {};\npub const HALF_DEGREE: usize = {};\npub const MOD_Q: u64 = {};\n\
+            "/// The cyclotomic family of the ring, from the ring spec's `family` field.\n\
+             #[derive(Clone, Copy, PartialEq, Eq, Debug)]\n\
+             pub enum RingFamily {{\n    /// `Z_q[X]/(X^N + 1)`, `N` a power of two.\n    PowerOfTwo,\n    \
+             /// `Z_p[X]/(X^{{2n}} - X^n + 1)`, conductor `9 * 2^k`, over Goldilocks.\n    Trinomial,\n}}\n\
+             pub const RING_FAMILY: RingFamily = RingFamily::{};\n\
+             pub const DEGREE: usize = {};\npub const HALF_DEGREE: usize = {};\npub const MOD_Q: u64 = {};\n\
              pub const SLOT_DEGREE: usize = {};\npub const NUM_SLOTS: usize = {};\n\
              pub const NOF_BATCHES: usize = {};\n",
+            family,
             spec.degree,
             spec.degree / 2,
             spec.mod_q,
@@ -85,24 +122,39 @@ fn parse_ring(text: &str) -> Result<RingSpec, String> {
         let (key, value) = line
             .split_once('=')
             .ok_or_else(|| format!("expected `key = value`, found {line:?}"))?;
-        let (key, value) = (key.trim(), value.trim().replace('_', ""));
+        let (key, value) = (key.trim(), value.trim().to_string());
         if fields.insert(key.to_string(), value).is_some() {
             return Err(format!("`{key}` is given twice"));
         }
     }
+    // A string, quoted as in TOML.
+    let family = fields.remove("family");
+    let family = match family.as_deref().map(|value| value.trim_matches('"')) {
+        None | Some("power_of_two") => Family::PowerOfTwo,
+        Some("trinomial") => Family::Trinomial,
+        Some(other) => {
+            return Err(format!(
+                "`family` must be \"power_of_two\" or \"trinomial\", found {other:?}"
+            ))
+        }
+    };
     let mut take = |key: &str| fields.remove(key).ok_or_else(|| format!("missing `{key}`"));
+    // Numbers may use `_` as a digit separator; strings such as `family` keep theirs.
     let int = |key: &str, value: String| {
         value
+            .replace('_', "")
             .parse::<u64>()
             .map_err(|_| format!("`{key}` must be an unsigned integer, found {value:?}"))
     };
     let spec = RingSpec {
+        family,
         degree: int("degree", take("degree")?)?,
         mod_q: int("mod_q", take("mod_q")?)?,
         tau: int("tau", take("tau")?)?,
         op_norm_bound: {
             let value = take("op_norm_bound")?;
             value
+                .replace('_', "")
                 .parse::<f64>()
                 .map_err(|_| format!("`op_norm_bound` must be a number, found {value:?}"))?
         },
@@ -122,7 +174,54 @@ const MAX_DEGREE: u64 = 256;
 const Q_MIN_BITS: u32 = 15;
 const Q_MAX_BITS: u32 = 50;
 
+/// The Goldilocks prime `2^64 - 2^32 + 1`, the modulus of the trinomial family.
+const GOLDILOCKS_P: u64 = 0xffff_ffff_0000_0001;
+/// The degree `3 * 2^5` of the trinomial family (conductor 288): only `k = 5` is supported.
+const TRINOMIAL_DEGREE: u64 = 96;
+
 fn validate_ring(spec: &RingSpec) -> Result<(), String> {
+    match spec.family {
+        Family::PowerOfTwo => validate_power_of_two(spec)?,
+        Family::Trinomial => validate_trinomial(spec)?,
+    }
+    let n = spec.degree;
+    if spec.tau == 0 || spec.tau > n {
+        return Err(format!("tau {} must lie in [1, degree]", spec.tau));
+    }
+    if !(spec.op_norm_bound.is_finite() && spec.op_norm_bound > 0.0) {
+        return Err(format!(
+            "op_norm_bound {} must be positive",
+            spec.op_norm_bound
+        ));
+    }
+    if !matches!(spec.projection_batches, 2 | 3) {
+        return Err(format!(
+            "projection_batches {} must be 2 or 3",
+            spec.projection_batches
+        ));
+    }
+    Ok(())
+}
+
+/// `X^{2n} - X^n + 1 = Phi_{9 * 2^k}` of degree `3 * 2^k` over Goldilocks: it splits into `2^k`
+/// irreducible cubics `X^3 - eta_j`, `eta_j` the primitive `3 * 2^k`-th roots of unity. Here
+/// `k = 5`: `X^96 - X^48 + 1 = Phi_288`, 32 slots.
+fn validate_trinomial(spec: &RingSpec) -> Result<(), String> {
+    let (n, q) = (spec.degree, spec.mod_q);
+    if n != TRINOMIAL_DEGREE {
+        return Err(format!(
+            "degree {n} must be {TRINOMIAL_DEGREE} (conductor 288) for the trinomial family"
+        ));
+    }
+    if q != GOLDILOCKS_P {
+        return Err(format!(
+            "mod_q {q} must be the Goldilocks prime {GOLDILOCKS_P} for the trinomial family"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_power_of_two(spec: &RingSpec) -> Result<(), String> {
     let (n, q) = (spec.degree, spec.mod_q);
     if !n.is_power_of_two() || !(MIN_DEGREE..=MAX_DEGREE).contains(&n) {
         return Err(format!(
@@ -149,21 +248,6 @@ fn validate_ring(spec: &RingSpec) -> Result<(), String> {
             n.trailing_zeros() - 1,
             (q - 1).trailing_zeros(),
             slot_degree(n, q)
-        ));
-    }
-    if spec.tau == 0 || spec.tau > n {
-        return Err(format!("tau {} must lie in [1, degree]", spec.tau));
-    }
-    if !(spec.op_norm_bound.is_finite() && spec.op_norm_bound > 0.0) {
-        return Err(format!(
-            "op_norm_bound {} must be positive",
-            spec.op_norm_bound
-        ));
-    }
-    if !matches!(spec.projection_batches, 2 | 3) {
-        return Err(format!(
-            "projection_batches {} must be 2 or 3",
-            spec.projection_batches
         ));
     }
     Ok(())

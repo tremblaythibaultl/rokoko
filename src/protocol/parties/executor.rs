@@ -119,6 +119,10 @@ fn run(
         serialise.as_secs_f64() * 1e3,
         deserialise.as_secs_f64() * 1e3
     );
+    // The wire bytes, for scripts/proof-hash.sh; the proof is complete by now.
+    if let Some(path) = std::env::var_os("ROKOKO_PROOF_OUT") {
+        std::fs::write(&path, &bytes).expect("ROKOKO_PROOF_OUT must be a writable path");
+    }
 
     let start = std::time::Instant::now();
     let mut verifier_boundary = None;
