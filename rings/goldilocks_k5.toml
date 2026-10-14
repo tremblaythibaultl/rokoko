@@ -3,5 +3,7 @@
 family = "trinomial"
 degree = 96
 mod_q = 18446744069414584321 # 2^64 - 2^32 + 1
-tau = 48 # provisional, uncalibrated (Phase 3): C(96,48) * 2^48 = 2^140.4 (Finding 6)
-op_norm_bound = 1000.0 # provisional, uncalibrated (Phase 3): generous, rejects nothing
+# The smallest tau with 2^128 challenges and invertible differences (Finding 6), then the
+# smallest bound on ||sigma(c)||_inf that keeps 2^128 after rejection, as for rings/*_d4.toml.
+tau = 39 # C(96,39) * 2^39 = 2^128.95 challenges before rejection; Pr[non-invertible difference] in [2^-139.3, 2^-115.0]
+op_norm_bound = 13.0 # about 1.90 sampling attempts per challenge, 2^128.03 after rejection; gamma_C = sqrt(3) * 13.0 = 22.5

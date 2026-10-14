@@ -161,7 +161,7 @@ Golden values for `p-26`: `Total proof size: 100.3199462890625 KB`, `Wire proof 
 
 Two tests already fail on `main`:
 
-- `common::short_challenge::tests::challenge_stream_fingerprint`, on both rings: the stream hashes to `710f97b1…` against the pinned `5670da5c…`. Nothing in this port touches the short-challenge sampler.
+- `common::short_challenge::tests::challenge_stream_fingerprint`, on both rings, against the pinned `5670da5c…`: the stream hashes to `710f97b1…` on the default ring and to `422675347b…` on `n128_d4` (corrected after the Phase 3 review). Nothing in this port touches the short-challenge sampler.
 - The doctest at `protocol::sumchecks::builder::selected_input_pieces` (line 46): the block is prose, not Rust (`expected one of ! or ::, found =`).
 
 Most unit tests compare with `debug_assert*`, which `--release` compiles out. Only the debug-profile run checks them.
@@ -397,3 +397,148 @@ A read-only review of the Phase 2 diff found no high- or medium-severity bug.
 - `build.rs` stripped `_` from every spec value before matching `family`, so an explicit `family = "power_of_two"` (the documented default) failed the build. Only numeric fields are stripped now.
 - Corrected the digit-count comment in `decomposition::test_random_mod_q` and the line numbers cited above (`project_fine.rs:552`, `verifier.rs:399` and `:741`).
 - `decomposition::test_random_mod_q` is flaky on `c2fecbd` too (unseeded RNG; the reviewer saw 8 failures in 200 runs). Left as is.
+
+### Phase 3: fold challenges (done)
+
+**Operator norm (`short_challenge.rs`, Finding 7).**
+
+- The module evaluates challenges at `zeta_m^j`, `gcd(j, m) = 1`, `j < m/2`, one `j` per conjugate pair, with a phase table `T[t] = exp(2 i pi t / m)` of length `m`, the conductor. New constants `CONDUCTOR` (`2N`, or `3 phi = 9 * 2^k`) and `PHASE_LEN = CONDUCTOR`, and a public `EVAL_EXPONENTS`, the `phi/2` exponents found by a `gcd` filter.
+- Trinomial paths, each selected by `RING_FAMILY` inside the existing functions:
+  - `op_norm_sq_sparse` (the sampler's hot path) and `op_norm_sq_sparse_scalar` go to `op_norm_sq_sparse_trinomial`. The exponents prime to `m` below `m/2` are `6t + 1` and `6t + 5` for `t < N/4`, so a nonzero at position `p` steps through two phase indices by `6p` mod `m`, with one conditional subtraction each. This is `tau * phi/2` additions per attempt, as for `X^N + 1`.
+  - `op_norm` (the dense reference) evaluates at every `EVAL_EXPONENTS` entry through the table, with the index `(j k) mod m` computed directly rather than stepped.
+  - `op_norm_direct` uses `cos` and `sin` at all `phi` exponents `j < m` that are odd and not multiples of 3, without the table or the `gcd` filter.
+- The power-of-two path does not change. The phase angle keeps its old expression `pi t / N`, so the table is bit-identical, and the AVX-512 kernel and `PHASE_ROWS` are textually unchanged. `op_norm_sq_sparse` returns to the trinomial path before the `#[cfg(avx512f)]` dispatch, so trinomial builds never reach the kernel's `PHASE_MASK` indexing. The fingerprint stream is still `710f97b1…` on the default ring, and `422675347b…` on `n128_d4`, the same value as a `HEAD` build in a temporary worktree. `p-26` is unchanged.
+- New `GAMMA_C`, the bound on the coefficient-embedding operator norm of an accepted challenge: `T_OP_NORM_BOUND` for `X^N + 1`, where `||c||_op = ||sigma(c)||_inf`, and `sqrt(3) * T_OP_NORM_BOUND` for the trinomial family (the note, Lemma 3.8).
+
+**`gamma_C` consumers.** `T_OP_NORM_BOUND` is used only by `debug_hardness.rs`, in its two live extracted-witness bounds (`check_sumcheck_round`, `check_simple_round`) and in one commented-out copy. All three now use `GAMMA_C`. The other users are the sampler itself and the `n128_d4` instantiation's spec assert. Nothing else consumes the challenge norm: the `NB_*` norm schedule is measured, not derived from it. The module builds with `--features debug-hardness` on the default ring and at `k = 5`. The other `sqrt(3)`, the extracted norm-check bound `sqrt(3) beta` (the note, Lemma 9 over `R_p`), is a separate Phase 4 item and is not in `debug_hardness.rs` yet.
+
+**Calibration of `tau` and `op_norm_bound`.**
+
+How the existing rings were calibrated. Commit `fe7f4dd` ("Give the degree-4 rings a 2^128 fold challenge space") applies this rule: take the smallest `tau` with `C(N, tau) 2^tau >= 2^128` before rejection, then the smallest bound, in steps of 0.1, that keeps `2^128` challenges after rejection. The rule was reconstructed from the commit's values, since the repository has no calibration script. Here `log2 |C| + log2 Pr[accept] >= 128`. The procedure below reproduces both rings:
+
+| ring | `tau` | bound | attempts | after rejection |
+|---|---|---|---|---|
+| `n128_d4` (spec) | 31 | 11.3 | 3.01 | `2^128.03` |
+| `n128_d4` (reproduced) | 31 | 11.3 | 3.01 | `2^128.03` |
+| `n256_d4` (spec) | 23 | 9.8 | 7.55 | `2^128.16` |
+| `n256_d4` (reproduced) | 23 | 9.8 | 7.51 | `2^128.17` |
+
+The default ring (`tau = 22`, bound 9.8, `2^103`) predates this rule.
+
+Invertibility, the second constraint (Finding 6). `goldilocks-note/port-checks/fixed_weight_invertibility.py` now also scans `tau`. It reports the smallest `tau` with `|C| >= 2^128` and the smallest `tau` whose pessimistic estimate (`P1 = P0`) is at most `2^-100`, the note's target:
+
+| phi | smallest `tau` for `2^128` | smallest `tau` for `Pr[non-invertible] <= 2^-100` |
+|---|---|---|
+| 96 | 39 (`2^128.95`) | 33 (`2^-100.41`) |
+| 192 | 25 (`2^128.59`) | 32 (`2^-103.37`); 31 gives `2^-99.95` |
+
+The op-norm distributions come from 10^6 attempts per `tau`, drawn through the sampler's own Fisher-Yates stream and evaluated on the sparse path. The code is `goldilocks-note/port-checks/op_norm_calibration.rs`, a test module to append to `short_challenge.rs`; its outputs are `op_norm_calibration_{k5,k6,n128,n256}.txt` next to it.
+
+The chosen values:
+
+- **`k = 5`: `tau = 39`, `op_norm_bound = 13.0`.** The set size binds. This gives `2^128.95` challenges before rejection, an acceptance rate of 0.527 (1.90 attempts) and `2^128.03` after rejection. `Pr[non-invertible]` lies in `[2^-139.3, 2^-115.0]`, and `gamma_C = 22.52`.
+- **`k = 6`: `tau = 32`, `op_norm_bound = 11.2`.** Invertibility binds. The set (`2^153.11`) is then so large that the 128-bit rule would ask for a `2^-25` quantile, about `3.6 * 10^7` attempts. The bound is therefore the smallest one with at most 8 expected attempts, the precedent of `n256_d4` (7.55). That is an acceptance rate of 0.132 (7.57 attempts) and `2^150.19` after rejection. `Pr[non-invertible]` lies in `[2^-131.2, 2^-103.4]`, and `gamma_C = 19.40`.
+
+The distribution of `||sigma(c)||_inf` before rejection (10^6 attempts):
+
+| ring | `tau` | min | 1% | 10% | 50% | mean | 90% | 99% | max |
+|---|---|---|---|---|---|---|---|---|---|
+| `k = 5` | 39 | 8.25 | 10.16 | 11.21 | 12.89 | 13.10 | 15.25 | 17.77 | 25.46 |
+| `k = 6` | 32 | 8.49 | 10.15 | 11.04 | 12.48 | 12.65 | 14.48 | 16.62 | 23.40 |
+
+The coefficient operator norm `||c||_op` (power iteration on `M_c^T M_c`, 300 attempts per `tau`) is between 1.08 and 1.66 times `||sigma(c)||_inf`, with a mean of 1.35, at every `tau` tried for `k = 5` and `k = 6`. It always stays below `sqrt(3)`, and matches the note's 1.2-1.6 for uniform ternary challenges. On the power-of-two rings the ratio is 1.000, as expected.
+
+Alternatives, recorded for the user. The `k = 5` rows follow the 128-bit rule, under which the bound falls as `tau` grows, at the cost of more attempts. The `k = 6` rows are the neighbouring bounds at `tau = 32` under the 8-attempt cap:
+
+| `k` | `tau` | bound | attempts |
+|---|---|---|---|
+| 5 | 40 | 11.8 | 5.44 |
+| 5 | 41 | 11.3 | 13.7 |
+| 5 | 42 | 11.0 | 32 |
+| 5 | 48 | 10.2 | about 5100 |
+| 6 | 32 | 11.0 | 10.8 |
+| 6 | 32 | 11.5 | 4.88 |
+
+So `k = 5` at `tau = 40` would lower `gamma_C` by 9% (to 20.4) for 2.9 times the sampling cost. The plan's provisional `tau = 48` for `k = 5` would need about 5100 attempts to keep `2^128`.
+
+**Challenge samplers at `p`.** The fold challenges and the field challenges are distinct samplers:
+
+- Fold challenges: `sample_low_op_norm_ring_*` call `sample_short_challenge_into`, which draws fixed-weight ternary challenges and writes `-1` as `MOD_Q - 1`. They are not in the challenge field.
+- Field challenges: `sample_ring_element_ntt_slots_*` sample a `FieldExtension` (3 residues mod `p`, uniform by rejection since Phase 1) and embed it on the homogenized diagonal `Z_p[tau]`.
+
+The new test `hash::field_challenges_are_fixed_by_conjugation_and_fold_challenges_are_not` (trinomial only) runs both samplers through a transcript. The field challenges satisfy `conj(r) = r` (the plan's testing invariant). The fold challenges are ternary of weight `TAU` and are not fixed by conjugation. The invariant is specific to the trinomial family's `tau`-aligned diagonal, which is why the test is `cfg`-gated: it is new, and no existing test is hidden.
+
+**Tests.**
+
+- The four `short_challenge` tests that failed at `p` pass unchanged. Their power-of-two assumptions were inside the functions they call, not in the tests: `fft_op_norm_matches_direct_on_fixed_vector`, `samples_have_correct_weight_and_op_norm`, `parametrized_samples_have_correct_weight_and_op_norm` (weight 23, bound 8.357, which still rejects at `phi = 96` and `192`) and `sparse_op_norm_matches_dense_fft`.
+- New tests, on every ring:
+  - `evaluation_points_are_the_roots_of_the_modulus`: the ring's modulus vanishes (`< 1e-10`) at `zeta_m^j` for every `j` in `EVAL_EXPONENTS` and for its conjugate. That is `phi` roots of a monic polynomial of degree `phi`, so the modulus is `Phi_m` and these are all its roots. It does not vanish at any other `m`-th root of unity.
+  - `canonical_embedding_is_multiplicative`: `(ab)(zeta^j) = a(zeta^j) b(zeta^j)` at every evaluation point, for the ring's own product of centered fixed-weight challenges.
+  - `challenges_have_operator_norm_at_most_gamma_c`: for 16 sampled challenges, the power-iteration estimate of `||c||_op` (multiplication matrix built from ring products) is at most `GAMMA_C` and at most `sqrt(3) ||sigma(c)||_inf`. For the trinomial family the largest ratio `||c||_op / ||sigma(c)||_inf` exceeds 1.1, so the factor is needed. For `X^N + 1` it is at most 1 and `GAMMA_C = T_OP_NORM_BOUND`.
+- Mutation checks at `k = 5`. Each mutation was applied, the `short_challenge` tests run, and the code restored (byte-compared against a copy). `challenge_stream_fingerprint` fails in every run, as it does without a mutation.
+  - Phase table built for `m = N` instead of `3N`: fails `fft_op_norm_matches_direct_on_fixed_vector` and `challenges_have_operator_norm_at_most_gamma_c`.
+  - Coprimality filter reduced to odd `j`: fails 7 tests, including `evaluation_points_are_the_roots_of_the_modulus`, `canonical_embedding_is_multiplicative` and `sparse_op_norm_matches_dense_fft`.
+  - `sqrt(3)` dropped from `GAMMA_C`: fails `challenges_have_operator_norm_at_most_gamma_c`.
+  - Sparse step `4p` instead of `6p`: fails 4 tests, including `sparse_op_norm_matches_dense_fft` and `samples_have_correct_weight_and_op_norm`.
+  - Second index started at `7p` instead of `5p`: fails 3 tests, including `sparse_op_norm_matches_dense_fft`.
+
+**`challenge_stream_fingerprint`.** The cause of this pre-existing failure is now established. `EXPECTED_FINGERPRINT` (`5670da5c…`) was pinned in `251db0d` with `T_OP_NORM_BOUND = 10.0`, and `4ee89b9` lowered the bound to 9.8 without re-pinning it. A temporary probe on the default ring hashed the stream of `sample_fixed_weight_challenge::<22>` at bound 10.0 and got exactly `5670da5c…`; at 9.8 it got `710f97b1…`, the value the test reports. The sampler algorithm has therefore not changed since it was pinned. The test is left untouched for the user to decide. Options:
+
+- re-pin to the current stream;
+- make the test sample with explicit parameters (`W = 22`, bound 10.0), which reproduces the original pin on `N = 128`.
+
+Either way the fingerprint depends on `N`, `TAU` and the bound, so one constant cannot hold on every ring.
+
+**Results.**
+
+| Command | Result |
+|---|---|
+| `incomplete-rexl`, `cargo +nightly test` | 9 unit + 6 Goldilocks + 27 integration + 8 trinomial pass |
+| `cargo +nightly test --lib` (debug), default ring | 187 pass, 1 fail (`challenge_stream_fingerprint`) |
+| `ROKOKO_RING=rings/n128_d4.toml cargo +nightly test --release --lib` | 187 pass, 1 fail (the same) |
+| `cargo +nightly run --release -- p-26` | `100.3199462890625 KB` and `112.0703125 KB`; repetition rate 2.18 as before |
+| `ROKOKO_RING=rings/goldilocks_k5.toml cargo +nightly test --lib` (debug) | 187 pass, 8 fail |
+| `ROKOKO_RING=rings/goldilocks_k6.toml cargo +nightly test --lib` (debug) | 187 pass, 8 fail (the same 8) |
+| `cargo +nightly build --lib --features debug-hardness`, default and `k = 5` | builds |
+
+The 3 new generic tests account for 184 to 187 on the existing rings. At `p` they and the new hash test take the count from 191 to 195. The 8 failures at `p` are `challenge_stream_fingerprint` (pre-existing, see above) and the 7 Phase 4 tests of the Phase 2 table:
+
+- `project_fine`: `test_batch_projection`, `test_const_term_relation_to_prove`, `exact_projection_paths_match_the_lazy_kernels`;
+- `executor`: `three_openings_round_trip`, `three_decomposition_chunks_round_trip`, still the projection-shape overrun at `project_fine.rs:552`;
+- `snark`: `test_conj_segment_ct_zero_roundtrip`, `test_norm_claim_roundtrip`.
+
+`decomposition::test_random_mod_q` did not flake in these runs.
+
+**Deferred, and notes for Phases 4 and 5.**
+
+- Phase 4: the norm-check factor (`Tr(v)/phi <= (3/2) beta^2`, extracted `sqrt(3) beta`) and the guard `3 r' beta'^2 < p/2` are separate from `gamma_C` and still to do. `debug_hardness.rs` now carries the challenge-side `sqrt(3)`, but not the norm-check one.
+- Phase 5: the estimator must use `gamma_C = sqrt(3) * op_norm_bound` (22.5 at `k = 5`, 19.4 at `k = 6`), not the spec's `op_norm_bound`. If the parameters turn out sensitive to `gamma_C`, the alternatives above (`k = 5`, `tau = 40`, bound 11.8) are available.
+- The Goldilocks specs fix `tau` and the bound; any later change also changes the fold-challenge transcripts at `p`.
+- `benches/bench.rs` `op_norm_sq_sparse` uses 22 hard-coded positions up to 127, which panic at `N = 96`. It is a bench, not a test, and is left as is.
+- Items to fold back into the note:
+  - the fixed-weight `tau` per `k`;
+  - the measured `||c||_op / ||sigma(c)||_inf` range for fixed-weight challenges (1.08-1.66, mean 1.35).
+
+**Unverified.**
+
+- The invertibility numbers are the plan's heuristic range (Finding 6), not a proof, and do not account for the op-norm rejection, which the note argues is negligible.
+- The calibration rule is reconstructed from `fe7f4dd`'s values. The attempt cap of 8 for `k = 6` follows the `n256_d4` precedent (confirmed by the user, see below).
+- The x86 paths were neither compiled nor run. The edit sits before the `#[cfg(avx512f)]` block, which is textually unchanged.
+- Sampler performance at `p` was not benchmarked.
+
+### Review fixes after Phase 3
+
+A read-only review of the Phase 3 diff found no high- or medium-severity bug. It re-derived the evaluation set, the `sqrt(3)` factor and the calibration independently, and re-ran every command of the table above with the same counts.
+
+- The Phase 0 note on `challenge_stream_fingerprint` gave `710f97b1…` for both rings; on `n128_d4` the stream hashes to `422675347b…`.
+- The alternatives table's header now says that its `k = 6` rows are neighbouring bounds at `tau = 32`, not values of the 128-bit rule. The attempt count the rule would need at `k = 6` is about `3.6 * 10^7`, not `3 * 10^7`.
+- In `debug_hardness.rs`, the `gamma_C` sentence moved after the justification of the inequality it qualifies.
+- `cargo build --features debug-hardness` at `k = 5` stops on the binary's intended `compile_error!`; the `--lib` build is the one that applies, as the table says.
+
+Decisions taken by the user:
+
+- `k = 5` keeps `tau = 39` (bound 13.0). Revisit in Phase 5 against `tau = 40` (bound 11.8, 5.44 attempts) once the estimator shows the effect of `gamma_C`.
+- `k = 6` keeps the 8-attempt cap of the `n256_d4` precedent (`tau = 32`, bound 11.2).
+- `challenge_stream_fingerprint` stays failing, as on `main`; it is not part of the port.
+
+Left as is: the bounds-checked indexing in `op_norm_sq_sparse_trinomial` (not benchmarked; Phase 7), and the test name `fft_op_norm_matches_direct_on_fixed_vector`, which no longer uses an FFT on the trinomial family.

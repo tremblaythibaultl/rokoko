@@ -1,16 +1,25 @@
-//! Short ternary challenge sampler for R = Z[X]/(X^N + 1).
+//! Short ternary challenge sampler.
 //!
-//! Each challenge has a fixed weight and operator norm bounded by a rejection
-//! threshold, TAU and T_OP_NORM_BOUND by default. For a sparse `c = sum_k eps_k * X^{p_k}`,
+//! Each challenge has a fixed weight and a canonical-embedding norm `||sigma(c)||_inf` bounded by
+//! a rejection threshold, TAU and T_OP_NORM_BOUND by default. The embeddings are the evaluations
+//! at the primitive `m`-th roots of unity, `m` the conductor, one per conjugate pair. For a sparse
+//! `c = sum_k eps_k * X^{p_k}`,
 //!
 //! ```text
-//! c(zeta^{2j+1}) = sum_k eps_k * T[((2j+1) * p_k) mod 2N]
+//! c(zeta_m^j) = sum_k eps_k * T[(j * p_k) mod m],   gcd(j, m) = 1,  j < m/2,
 //! ```
 //!
-//! with `T[m] = exp(i*pi*m/N)`. The hot path uses this directly via a length-2N
-//! phase LUT instead of a full FFT.
+//! with `T[t] = exp(2 i pi t / m)`. The hot path uses this directly via a length-`m` phase LUT
+//! instead of a full FFT.
+//!
+//! - For `Z_q[X]/(X^N + 1)`, `m = 2N` and `j = 2j' + 1`. The power basis is orthogonal for the
+//!   canonical embedding, so `||sigma(c)||_inf` is exactly the coefficient-embedding operator
+//!   norm `||c||_op`.
+//! - For `Z_p[X]/(X^{2n} - X^n + 1)`, `X^{2n} - X^n + 1 = Phi_m(X)` with `m = 9 * 2^k = 3 phi`,
+//!   and `j = 1, 5 mod 6`. Here `||c||_op <= sqrt(3) ||sigma(c)||_inf` only (the note, Lemma 3.8),
+//!   so a challenge accepted at T_OP_NORM_BOUND has operator norm at most [`GAMMA_C`].
 
-use crate::common::config::{DEGREE, MOD_Q};
+use crate::common::config::{RingFamily, DEGREE, MOD_Q, RING_FAMILY};
 use crate::common::hash::HashWrapper;
 use crate::common::ring_arithmetic::{Representation, RingElement};
 use num::Complex;
@@ -18,10 +27,45 @@ use std::sync::LazyLock;
 
 include!(concat!(env!("OUT_DIR"), "/challenge.rs"));
 
+/// Bound on the coefficient-embedding operator norm `gamma_C = max ||c||_op` of every challenge
+/// [`sample_short_challenge`] accepts. The sampler bounds `||sigma(c)||_inf` by
+/// T_OP_NORM_BOUND; for `X^N + 1` the two norms coincide, and for `X^{2n} - X^n + 1` the note's
+/// Lemma 3.8 gives `||c||_op <= sqrt(3) ||sigma(c)||_inf`.
+pub const GAMMA_C: f64 = match RING_FAMILY {
+    RingFamily::PowerOfTwo => T_OP_NORM_BOUND,
+    RingFamily::Trinomial => SQRT_3 * T_OP_NORM_BOUND,
+};
+const SQRT_3: f64 = 1.7320508075688772;
+
 const N: usize = DEGREE;
 const LOG_N: usize = N.trailing_zeros() as usize;
-const PHASE_LEN: usize = 2 * N;
+/// The conductor `m`: `2N` for `X^N + 1`, `9 * 2^k = 3N` for `X^{2n} - X^n + 1`.
+const CONDUCTOR: usize = match RING_FAMILY {
+    RingFamily::PowerOfTwo => 2 * N,
+    RingFamily::Trinomial => 3 * N,
+};
+const PHASE_LEN: usize = CONDUCTOR;
+/// Only meaningful for `X^N + 1`, where `PHASE_LEN` is a power of two.
 const PHASE_MASK: usize = PHASE_LEN - 1;
+
+// The trinomial path steps through `j = 6t + 1` and `j = 6t + 5`, `t < N/4`.
+const _: () = assert!(!matches!(RING_FAMILY, RingFamily::Trinomial) || N % 12 == 0);
+
+/// The exponents `j < m/2` with `gcd(j, m) = 1`, one per conjugate pair `(j, m - j)`, in
+/// increasing order: `2j' + 1` for `X^N + 1`, `j = 1, 5 mod 6` for `X^{2n} - X^n + 1`.
+pub static EVAL_EXPONENTS: LazyLock<[usize; N / 2]> = LazyLock::new(|| {
+    let exponents: Vec<usize> = (1..CONDUCTOR / 2)
+        .filter(|&j| gcd(j, CONDUCTOR) == 1)
+        .collect();
+    exponents.try_into().expect("phi(m)/2 exponents below m/2")
+});
+
+const fn gcd(mut a: usize, mut b: usize) -> usize {
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    a
+}
 
 static PRE_TWIST: LazyLock<[Complex<f64>; N]> = LazyLock::new(|| {
     let mut arr = [Complex::new(0.0, 0.0); N];
@@ -32,19 +76,25 @@ static PRE_TWIST: LazyLock<[Complex<f64>; N]> = LazyLock::new(|| {
     arr
 });
 
+/// The angle of `T[t] = exp(2 i pi t / m)`. The `X^N + 1` form is kept as it was, `pi t / N`.
+fn phase_angle(t: usize) -> f64 {
+    match RING_FAMILY {
+        RingFamily::PowerOfTwo => std::f64::consts::PI * (t as f64) / (N as f64),
+        RingFamily::Trinomial => 2.0 * std::f64::consts::PI * (t as f64) / (CONDUCTOR as f64),
+    }
+}
+
 static PHASE_RE: LazyLock<[f64; PHASE_LEN]> = LazyLock::new(|| {
     let mut arr = [0.0f64; PHASE_LEN];
     for m in 0..PHASE_LEN {
-        let angle = std::f64::consts::PI * (m as f64) / (N as f64);
-        arr[m] = angle.cos();
+        arr[m] = phase_angle(m).cos();
     }
     arr
 });
 static PHASE_IM: LazyLock<[f64; PHASE_LEN]> = LazyLock::new(|| {
     let mut arr = [0.0f64; PHASE_LEN];
     for m in 0..PHASE_LEN {
-        let angle = std::f64::consts::PI * (m as f64) / (N as f64);
-        arr[m] = angle.sin();
+        arr[m] = phase_angle(m).sin();
     }
     arr
 });
@@ -92,7 +142,12 @@ fn fft_in_place(a: &mut [Complex<f64>; N]) {
     }
 }
 
+/// `||sigma(c)||_inf` by a dense evaluation: the twisted FFT for `X^N + 1`, and a sum over the
+/// phase table at every exponent of [`EVAL_EXPONENTS`] for `X^{2n} - X^n + 1`.
 pub fn op_norm(c: &[i8; N]) -> f64 {
+    if RING_FAMILY == RingFamily::Trinomial {
+        return op_norm_dense_trinomial(c);
+    }
     let pt = &*PRE_TWIST;
     let mut a = [Complex::new(0.0, 0.0); N];
     for j in 0..N {
@@ -112,10 +167,30 @@ pub fn op_norm(c: &[i8; N]) -> f64 {
     max_sq.sqrt()
 }
 
+fn op_norm_dense_trinomial(c: &[i8; N]) -> f64 {
+    let mut max_sq = 0.0f64;
+    for &j in EVAL_EXPONENTS.iter() {
+        let mut re = 0.0f64;
+        let mut im = 0.0f64;
+        for k in 0..N {
+            if c[k] != 0 {
+                let t = (j * k) % CONDUCTOR;
+                re += c[k] as f64 * PHASE_RE[t];
+                im += c[k] as f64 * PHASE_IM[t];
+            }
+        }
+        max_sq = max_sq.max(re * re + im * im);
+    }
+    max_sq.sqrt()
+}
+
 #[inline(always)]
 pub fn op_norm_sq_sparse<const W: usize>(positions: &[u8; W], signs: &[i8; W]) -> f64 {
     let in_range = positions.iter().all(|&p| (p as usize) < N);
     assert!(in_range, "position out of range");
+    if RING_FAMILY == RingFamily::Trinomial {
+        return op_norm_sq_sparse_trinomial(positions, signs);
+    }
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
     unsafe {
         return op_norm_sq_sparse_avx512(positions, signs);
@@ -125,6 +200,9 @@ pub fn op_norm_sq_sparse<const W: usize>(positions: &[u8; W], signs: &[i8; W]) -
 }
 
 pub fn op_norm_sq_sparse_scalar<const W: usize>(positions: &[u8; W], signs: &[i8; W]) -> f64 {
+    if RING_FAMILY == RingFamily::Trinomial {
+        return op_norm_sq_sparse_trinomial(positions, signs);
+    }
     let phase_re: &[f64; PHASE_LEN] = &PHASE_RE;
     let phase_im: &[f64; PHASE_LEN] = &PHASE_IM;
 
@@ -142,6 +220,49 @@ pub fn op_norm_sq_sparse_scalar<const W: usize>(positions: &[u8; W], signs: &[i8
             v_re[j] += s * pr;
             v_im[j] += s * pi;
             idx = (idx + step) & PHASE_MASK;
+        }
+    }
+
+    let mut max_sq = 0.0f64;
+    for j in 0..(N / 2) {
+        let m = v_re[j] * v_re[j] + v_im[j] * v_im[j];
+        if m > max_sq {
+            max_sq = m;
+        }
+    }
+    max_sq
+}
+
+/// The sparse sum for `X^{2n} - X^n + 1`. The exponents prime to `m = 9 * 2^k` below `m/2` are
+/// `6t + 1` and `6t + 5` for `t < m/12 = N/4`, so a nonzero at position `p` steps through the
+/// phases `p (6t + 1)` and `p (6t + 5)` by `6p`, modulo `m`. Slot `2t` holds `j = 6t + 1` and slot
+/// `2t + 1` holds `j = 6t + 5`, the order of [`EVAL_EXPONENTS`].
+fn op_norm_sq_sparse_trinomial<const W: usize>(positions: &[u8; W], signs: &[i8; W]) -> f64 {
+    let phase_re: &[f64; PHASE_LEN] = &PHASE_RE;
+    let phase_im: &[f64; PHASE_LEN] = &PHASE_IM;
+
+    let mut v_re = [0.0f64; N / 2];
+    let mut v_im = [0.0f64; N / 2];
+
+    for k in 0..W {
+        let p = positions[k] as usize;
+        let s = signs[k] as f64;
+        let step = (6 * p) % CONDUCTOR;
+        let mut idx_1 = p % CONDUCTOR;
+        let mut idx_5 = (5 * p) % CONDUCTOR;
+        for t in 0..(N / 4) {
+            v_re[2 * t] += s * phase_re[idx_1];
+            v_im[2 * t] += s * phase_im[idx_1];
+            v_re[2 * t + 1] += s * phase_re[idx_5];
+            v_im[2 * t + 1] += s * phase_im[idx_5];
+            idx_1 += step;
+            if idx_1 >= CONDUCTOR {
+                idx_1 -= CONDUCTOR;
+            }
+            idx_5 += step;
+            if idx_5 >= CONDUCTOR {
+                idx_5 -= CONDUCTOR;
+            }
         }
     }
 
@@ -202,7 +323,12 @@ unsafe fn op_norm_sq_sparse_avx512<const W: usize>(positions: &[u8; W], signs: &
     _mm512_reduce_max_pd(mm)
 }
 
+/// `||sigma(c)||_inf` from the trigonometric functions, at every embedding (both members of each
+/// conjugate pair): the reference for [`op_norm`] and [`op_norm_sq_sparse`].
 pub fn op_norm_direct(c: &[i8; N]) -> f64 {
+    if RING_FAMILY == RingFamily::Trinomial {
+        return op_norm_direct_trinomial(c);
+    }
     let mut max_sq = 0.0f64;
     let two_n = 2 * N;
     for j in (1..two_n).step_by(2) {
@@ -221,6 +347,26 @@ pub fn op_norm_direct(c: &[i8; N]) -> f64 {
         if m > max_sq {
             max_sq = m;
         }
+    }
+    max_sq.sqrt()
+}
+
+/// Every `j < m` prime to `m = 9 * 2^k`, that is odd and not a multiple of 3.
+fn op_norm_direct_trinomial(c: &[i8; N]) -> f64 {
+    let mut max_sq = 0.0f64;
+    for j in (1..CONDUCTOR).filter(|j| j % 2 != 0 && j % 3 != 0) {
+        let mut re = 0.0f64;
+        let mut im = 0.0f64;
+        for k in 0..N {
+            if c[k] == 0 {
+                continue;
+            }
+            let angle =
+                2.0 * std::f64::consts::PI * (((j * k) % CONDUCTOR) as f64) / (CONDUCTOR as f64);
+            re += c[k] as f64 * angle.cos();
+            im += c[k] as f64 * angle.sin();
+        }
+        max_sq = max_sq.max(re * re + im * im);
     }
     max_sq.sqrt()
 }
@@ -498,6 +644,163 @@ mod tests {
 
     const EXPECTED_FINGERPRINT: &str =
         "5670da5c3578390a8e449b8d42526135dcdb708c95054a31c5767281218c42b1";
+
+    /// `c(zeta_m^j)` from the trigonometric functions, for integer coefficients.
+    fn evaluate(c: &[i64], j: usize) -> Complex<f64> {
+        let mut z = Complex::new(0.0, 0.0);
+        for (k, &x) in c.iter().enumerate() {
+            let angle =
+                2.0 * std::f64::consts::PI * (((j * k) % CONDUCTOR) as f64) / (CONDUCTOR as f64);
+            z += Complex::new(angle.cos(), angle.sin()) * x as f64;
+        }
+        z
+    }
+
+    /// The ring's modulus `X^N + 1` or `X^{2n} - X^n + 1` at `zeta_m^j`.
+    fn modulus_at(j: usize) -> Complex<f64> {
+        let z = |e: usize| {
+            let angle =
+                2.0 * std::f64::consts::PI * (((j * e) % CONDUCTOR) as f64) / (CONDUCTOR as f64);
+            Complex::new(angle.cos(), angle.sin())
+        };
+        match RING_FAMILY {
+            RingFamily::PowerOfTwo => z(N) + 1.0,
+            RingFamily::Trinomial => z(N) - z(N / 2) + 1.0,
+        }
+    }
+
+    fn centered(x: u64) -> i64 {
+        if x > MOD_Q / 2 {
+            -((MOD_Q - x) as i64)
+        } else {
+            x as i64
+        }
+    }
+
+    fn ternary_element(c: &[i8; N]) -> RingElement {
+        let mut element = RingElement::new(Representation::Coefficients);
+        for j in 0..N {
+            element.v[j] = if c[j] < 0 { MOD_Q - 1 } else { c[j] as u64 };
+        }
+        element.to_representation(Representation::IncompleteNTT);
+        element
+    }
+
+    fn coefficients(element: &RingElement) -> Vec<i64> {
+        let mut element = element.clone();
+        element.to_representation(Representation::Coefficients);
+        element.v.iter().map(|&x| centered(x)).collect()
+    }
+
+    /// The evaluation points are the primitive `m`-th roots of unity, one per conjugate pair:
+    /// the modulus vanishes at all `phi` of them, so (being monic of degree `phi`) it is
+    /// `Phi_m`, and its roots are exactly these. It does not vanish at the other `m`-th roots.
+    #[test]
+    fn evaluation_points_are_the_roots_of_the_modulus() {
+        let exponents = &*EVAL_EXPONENTS;
+        assert!(exponents.windows(2).all(|w| w[0] < w[1]));
+        assert!(exponents.iter().all(|&j| j < CONDUCTOR / 2));
+        let mut roots = 0;
+        for j in 1..CONDUCTOR {
+            let value = modulus_at(j).norm();
+            let paired = exponents.contains(&j) || exponents.contains(&(CONDUCTOR - j));
+            if paired {
+                assert!(value < 1e-10, "modulus at zeta^{j} = {value}");
+                roots += 1;
+            } else {
+                assert!(
+                    value > 1e-3,
+                    "zeta^{j} is a root but not an evaluation point"
+                );
+            }
+        }
+        assert_eq!(roots, N);
+    }
+
+    /// The embedding is a ring homomorphism: `(ab)(zeta^j) = a(zeta^j) b(zeta^j)` for the ring's
+    /// own product, at every evaluation point.
+    #[test]
+    fn canonical_embedding_is_multiplicative() {
+        let mut hasher = HashWrapper::new();
+        for _ in 0..8 {
+            let (a, _) = sample_fixed_weight_challenge::<TAU>(&mut hasher, f64::INFINITY, b"a");
+            let (b, _) = sample_fixed_weight_challenge::<TAU>(&mut hasher, f64::INFINITY, b"b");
+            let product = coefficients(&(&ternary_element(&a) * &ternary_element(&b)));
+            let a: Vec<i64> = a.iter().map(|&x| x as i64).collect();
+            let b: Vec<i64> = b.iter().map(|&x| x as i64).collect();
+            for &j in EVAL_EXPONENTS.iter() {
+                let expected = evaluate(&a, j) * evaluate(&b, j);
+                let diff = (evaluate(&product, j) - expected).norm();
+                assert!(diff < 1e-9, "j = {j}: |difference| = {diff}");
+            }
+        }
+    }
+
+    /// The largest singular value of the multiplication matrix of `c`, by power iteration on
+    /// `M^T M`. It converges from below, so it never overstates the operator norm.
+    fn coefficient_operator_norm(c: &[i8; N]) -> f64 {
+        let element = ternary_element(c);
+        // Column `i` is `c X^i`.
+        let mut matrix = vec![0.0f64; N * N];
+        for i in 0..N {
+            let mut monomial = RingElement::new(Representation::Coefficients);
+            monomial.v[i] = 1;
+            monomial.to_representation(Representation::IncompleteNTT);
+            for (r, x) in coefficients(&(&element * &monomial))
+                .into_iter()
+                .enumerate()
+            {
+                matrix[r * N + i] = x as f64;
+            }
+        }
+        let mut x: Vec<f64> = (0..N).map(|i| 1.0 + (i % 7) as f64).collect();
+        let mut norm = 0.0;
+        for _ in 0..100 {
+            let length = x.iter().map(|a| a * a).sum::<f64>().sqrt();
+            x.iter_mut().for_each(|a| *a /= length);
+            let y: Vec<f64> = (0..N)
+                .map(|r| (0..N).map(|i| matrix[r * N + i] * x[i]).sum())
+                .collect();
+            norm = y.iter().map(|a| a * a).sum::<f64>().sqrt();
+            x = (0..N)
+                .map(|i| (0..N).map(|r| matrix[r * N + i] * y[r]).sum())
+                .collect();
+        }
+        norm
+    }
+
+    /// Accepted challenges have coefficient operator norm at most `GAMMA_C`. For the trinomial
+    /// family it exceeds `||sigma(c)||_inf`, and so T_OP_NORM_BOUND, on some samples: the factor
+    /// `sqrt(3)` of Lemma 3.8 is needed. For `X^N + 1` the two norms agree.
+    #[test]
+    fn challenges_have_operator_norm_at_most_gamma_c() {
+        let mut hasher = HashWrapper::new();
+        let mut largest_ratio = 0.0f64;
+        for _ in 0..16 {
+            let (c, _) = sample_short_challenge(&mut hasher);
+            let operator = coefficient_operator_norm(&c);
+            let sigma = op_norm(&c);
+            assert!(
+                operator <= GAMMA_C + 1e-9,
+                "||c||_op = {operator} > {GAMMA_C}"
+            );
+            assert!(operator <= sigma * SQRT_3 + 1e-9);
+            largest_ratio = largest_ratio.max(operator / sigma);
+        }
+        match RING_FAMILY {
+            RingFamily::PowerOfTwo => {
+                assert_eq!(GAMMA_C, T_OP_NORM_BOUND);
+                assert!(largest_ratio <= 1.0 + 1e-9);
+            }
+            RingFamily::Trinomial => {
+                assert_eq!(GAMMA_C, 3f64.sqrt() * T_OP_NORM_BOUND);
+                assert!(
+                    largest_ratio > 1.1,
+                    "largest ||c||_op / ||sigma(c)|| = {largest_ratio}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn ring_output_encoding_is_consistent() {

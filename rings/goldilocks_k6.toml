@@ -3,5 +3,8 @@
 family = "trinomial"
 degree = 192
 mod_q = 18446744069414584321 # 2^64 - 2^32 + 1
-tau = 32 # provisional, uncalibrated (Phase 3): C(192,32) * 2^32 = 2^153.1 (Finding 6)
-op_norm_bound = 1000.0 # provisional, uncalibrated (Phase 3): generous, rejects nothing
+# tau is set by the invertibility of differences (Finding 6), not by the set size (tau = 25
+# would give 2^128.6). The set is then large enough that the bound is limited by the sampling
+# cost: the smallest bound on ||sigma(c)||_inf with at most 8 attempts, as for rings/n256_d4.toml.
+tau = 32 # C(192,32) * 2^32 = 2^153.11 challenges before rejection; Pr[non-invertible difference] in [2^-131.2, 2^-103.4]
+op_norm_bound = 11.2 # about 7.57 sampling attempts per challenge, 2^150.19 after rejection; gamma_C = sqrt(3) * 11.2 = 19.4
