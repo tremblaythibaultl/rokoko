@@ -360,6 +360,11 @@ pub(crate) fn split_projection_flatter(
     (projection_flatter_0, projection_flatter_1)
 }
 
+// The lazy kernels of `projection_flatter_1_times_matrix` transpose `SLOT_DEGREE.ilog2()` times
+// and group `16 / SLOT_DEGREE` chunks, which assumes slots of degree 2 or 4. Degree-3 slots (the
+// trinomial family) come with Goldilocks, past `LAZY_REDUCTION`, so only the exact path serves them.
+const _: () = assert!(!LAZY_REDUCTION || matches!(SLOT_DEGREE, 2 | 4));
+
 /// Computes the product of projection_flatter_1 with the projection matrix.
 ///
 /// This function computes the linear combination:
@@ -573,6 +578,8 @@ unsafe fn flatter_1_times_matrix_by_subset_sums(
     Some(result_field)
 }
 
+/// Lazy kernels only, so `SLOT_DEGREE` is 2 or 4 (see the assertion above
+/// [`projection_flatter_1_times_matrix`]).
 #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
 const COARSE_GROUP: usize = 16 / SLOT_DEGREE;
 

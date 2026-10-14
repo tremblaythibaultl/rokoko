@@ -433,11 +433,13 @@ mod tests {
         reject_past_bound(&mut words, P, || stream.next().unwrap());
         assert_eq!(words, [0, P - 1, 11, 12, 5, 13]);
 
-        let bound = rejection_bound(MOD_Q);
-        let mut words = [0, MOD_Q, bound - 1, bound, u64::MAX];
+        // A modulus whose bound lies past it: `MOD_Q`, unless it is `P`, whose bound is `P`.
+        let q = if MOD_Q == P { (1 << 50) - 2687 } else { MOD_Q };
+        let bound = rejection_bound(q);
+        let mut words = [0, q, bound - 1, bound, u64::MAX];
         let mut stream = [bound + 1, 7, 8].into_iter();
-        reject_past_bound(&mut words, MOD_Q, || stream.next().unwrap());
-        assert_eq!(words, [0, MOD_Q, bound - 1, 7, 8]);
+        reject_past_bound(&mut words, q, || stream.next().unwrap());
+        assert_eq!(words, [0, q, bound - 1, 7, 8]);
     }
 
     /// Below the bound, uniform sampling is the plain reduction of the XOF words it always was.

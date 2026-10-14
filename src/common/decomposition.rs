@@ -387,8 +387,10 @@ fn out_of_window_coefficients_carry_into_the_top_digit() {
 fn test_random_mod_q() {
     let r = RingElement::random(Representation::IncompleteNTT);
     let data = vec![r];
-    let base_log = 13; // do we cover 52 bits?
-    let radix = 4;
+    let base_log = 13;
+    // Enough digits to cover `q`: `ceil(bits(q) / 13)`, so 4 for the 50-bit rings and 5 for
+    // Goldilocks.
+    let radix = (64 - MOD_Q.leading_zeros() as u64).div_ceil(base_log) as usize;
 
     let mut decomposed = decompose(&data, base_log, radix);
 

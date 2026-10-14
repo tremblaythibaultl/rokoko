@@ -3,7 +3,7 @@ use std::any::Any;
 use crate::{
     common::{
         arithmetic::{precompute_structured_values_fast, HALF_WAY_MOD_Q_RING_CF, LAZY_REDUCTION},
-        config::{DEGREE, MOD_Q, NOF_BATCHES},
+        config::{RingFamily, DEGREE, MOD_Q, NOF_BATCHES, RING_FAMILY},
         hash::HashWrapper,
         matrix::{HorizontallyAlignedMatrix, VerticallyAlignedMatrix},
         projection_matrix::ProjectionMatrix,
@@ -358,8 +358,21 @@ pub fn compute_j_batched_collectively(
     j_batched
 }
 
+// `reduce_conjugate_to_incomplete_ntt` and the lazy `compute_j_batched*` kernels assume `X^N + 1`
+// (negacyclic reversal, `SLOT_DEGREE.ilog2()` de-interleaving); the trinomial family is past
+// `LAZY_REDUCTION` and takes `compute_j_batched_exact`.
+const _: () = assert!(!LAZY_REDUCTION || matches!(RING_FAMILY, RingFamily::PowerOfTwo));
+
 /// The conjugate of `el mod q` in incomplete-NTT form, for `el` biased by `HALF_WAY_MOD_Q`.
+///
+/// Lazy kernels only: the AVX-512 path reverses `X^N + 1` coefficients and de-interleaves them by
+/// `SLOT_DEGREE.ilog2()` steps, which is wrong for the degree-3 slots of the trinomial family, whose
+/// modulus takes the exact path.
 fn reduce_conjugate_to_incomplete_ntt(el: &mut RingElement) {
+    assert!(
+        LAZY_REDUCTION && RING_FAMILY == RingFamily::PowerOfTwo,
+        "the lazy fine-projection kernels assume q < 2^50 and X^N + 1"
+    );
     #[cfg(all(target_arch = "x86_64", target_feature = "avx512f"))]
     if el.representation == Representation::Coefficients {
         unsafe {
@@ -1214,6 +1227,9 @@ mod tests {
     fn reduce_conjugate_matches_ntt_then_conjugate() {
         use crate::common::arithmetic::HALF_WAY_MOD_Q;
         crate::common::init_common();
+        if !LAZY_REDUCTION {
+            return; // a lazy-only kernel: its inputs are biased by `HALF_WAY_MOD_Q`, 0 here
+        }
         let mut hash_wrapper = HashWrapper::new();
         let spread = 1u64 << 58;
         for case in 0..64 {

@@ -268,3 +268,132 @@ A read-only review of the Phase 0-1 diff found no high- or medium-severity bug. 
 - New test `wide_adds_and_subs_reduce_non_canonical_operands`, at `p`, `2^64 - 59`, `2^63 - 25` and `2^62 + 135`. Both operands range over `q`, values near `2^64`, values in `[q, 2^64)` and residues, in every pairing. Removing the reduction from either `goldilocks::add` or the generic wide path makes it fail.
 
 Results: `incomplete-rexl` 9 unit + 6 Goldilocks + 27 integration pass in release and debug; main-crate lib in debug, 182 pass and 1 fail (`challenge_stream_fingerprint`, as on `main`); `p-26` verifies with `100.3199462890625 KB` and `112.0703125 KB`.
+
+### Phase 2: the ring (done)
+
+**Ring spec and `build.rs`.**
+
+- New optional field `family`: `"power_of_two"` (the default, `Z_q[X]/(X^N + 1)`) or `"trinomial"` (`Z_p[X]/(X^{2n} - X^n + 1)`, conductor `9 * 2^k`). The existing specs do not set it and validate exactly as before.
+- For `"trinomial"`, `build.rs` requires `degree = 3 * 2^k` with `k` in `{5, 6}` and `mod_q = p`, skips the power-of-two, `q < 2^50` and `2N >> v2(q-1)` rules, and emits `SLOT_DEGREE = 3`, `NUM_SLOTS = 2^k` and `HALF_DEGREE = n = phi/2`.
+- `ring.rs` gains `enum RingFamily` and `const RING_FAMILY`, and `build.rs` sets `cfg(rokoko_family = "power_of_two" | "trinomial")`. The code branches on the constant inside functions and on the `cfg` to pick types.
+- `rings/goldilocks_k5.toml` (`tau = 48`) and `rings/goldilocks_k6.toml` (`tau = 32`), both with `op_norm_bound = 1000.0`. Both values are marked provisional and uncalibrated (Phase 3).
+- The binary (`src/main.rs`) refuses to build for these rings with a `compile_error!` that names Phase 5. The library builds for both.
+
+**`incomplete-rexl`: `trinomial::TrinomialSlotRing`.**
+
+- Same interface as `SlotRing` (`new`, `mult`, `ntt_forward`, `ntt_inverse`, `ntt_inverse_into`, `dot`, `dot_many`), plus `slot_roots` and `slot_root_exponents`. The main crate picks the type with `cfg(rokoko_family)`, so the family is explicit and `SlotRing` is untouched; its doc now says it is the `X^N + 1` family.
+- The transform of each strided part is Finding 2: `theta = 7^{(p-1)/3L}` (`L = 2^k`, `h = L/2`), a first layer `a_lo + w a_hi`, `a_lo + a_hi - w a_hi` with `w = theta^h` and `w^5 = 1 - w`, then Cooley-Tukey butterflies that split `Y^{2m} - theta^E` into `Y^m -+ theta^{E/2}`. The inverse runs Gentleman-Sande and undoes the first layer with `(w - w^5)^{-1} h^{-1}`. Everything is scalar `goldilocks::{add, sub, mul}`, which reduce any `u64` input.
+- Slot order: slot `j` is position `j` of each part after the forward transform (the butterfly tree's order), with root `eta_j = theta^{e_j}`. `e_0 = 1`, so `alpha = FIELD_SHIFT_FACTOR = eta_0 = theta`.
+- `trinomial::cubic_mul`: the product modulo `X^3 - eta` by Karatsuba, 6 products plus 2 by `eta`. `dot` and `dot_many` sum the five `eta`-free terms per slot and multiply by `eta_j` once per output.
+
+**Main crate (`ring_arithmetic.rs`).**
+
+- `SLOT_RING` is `SlotRing` or `TrinomialSlotRing` by family. `SHIFT_FACTORS` is, for the trinomial family, part 0 of the slot transform of `Y = X^3`, that is `eta_j` in slot order; the power-of-two derivation is unchanged.
+- `naive_polynomial_multiplication` reduces through `X^{2n} = X^n - 1` from the top down. `conjugate_in_place_ref` goes through `conjugate_coefficients`, which uses the note's eq. (negpow) for the trinomial family.
+- `derive_conjugation_transform` is reused unchanged: in slot `j`, `X^{-1} = eta_j^{-1} X^2`, so every basis vector of part `r` lands in exactly one slot of part `(3 - r) mod 3`. Its `debug_assert` on that holds at `k = 5` and `k = 6`.
+- Homogenization (Finding 5), `degree3_homogenization`. With `eta_i = alpha^{e_i}`:
+  - slots with `e_i = 1 mod 3` use `X -> c Y`, `c^3 = eta_i/alpha`;
+  - slots with `e_i = 2 mod 3` use `X -> d Y^{-1} = d Y^2/alpha`, `d^3 = eta_i alpha`, which swaps parts 1 and 2 (`INVERTED_SLOTS`, exactly `NUM_SLOTS/2` slots);
+  - of the three cube roots, the one kept is the unique one that sends `tau`'s image to its image in slot 0, so the diagonal is `Z_p[tau]` and `conj(r) = r` for every element of it. Slot 0 keeps the identity.
+- Every slot-degree dispatch is explicit (`2`, `3`, `4`, otherwise `unreachable!`): the homogenization swaps, `INVERTED_SLOTS`, `get_roots_of_unity_trans`, `inverse`, the homogenized product and `FieldExtension`'s `Mul` and `MulAssign`. The degree-2 and degree-4 code is unchanged.
+- `FieldExtension` at degree 3: `degree3_mul` (Karatsuba through `cubic_mul`, Goldilocks only, checked by a `const` assertion) and `inverse_degree3` (adjugate over the norm, one batch inversion).
+- `constant_term_from_incomplete_ntt` is renamed `trace_over_degree`. The computation is unchanged. Its doc says it is the constant term only for `X^N + 1` and `x_0 + x_n/2` for the trinomial family. The call sites are listed under "Notes for Phase 4".
+- `subfield_generator()` builds `tau = X^h + X^{2h} - X^{4h}`.
+- Lazy-only kernels are gated. A `const` assertion in `helpers.rs` and another in `project_fine.rs` state that `LAZY_REDUCTION` implies slots of degree 2 or 4 and `X^N + 1`. They cover the `SLOT_DEGREE.ilog2()` transposes, `COARSE_GROUP = 16 / SLOT_DEGREE` and the negacyclic reversal of `reduce_conjugate_to_incomplete_ntt`, which also asserts it at run time. Goldilocks is past `LAZY_REDUCTION`, so these are unreachable at `p`. The `[u64; 4]` helper in `ring_to_field_combiner.rs` takes the first `SLOT_DEGREE` entries and is correct at degree 3.
+
+**Tests.**
+
+- `incomplete-rexl/tests/trinomial.rs`, 8 tests at `k = 5` and `k = 6`:
+  - the slot roots are the `L` distinct primitive `3L`-th roots, `eta_j = theta^{e_j}`;
+  - the forward transform evaluates each part at every `eta_j`;
+  - round trips, with inputs in `[p, 2^64)` read modulo `p`;
+  - `cubic_mul` against a schoolbook product, including unreduced operands;
+  - the slot product per slot, including aliasing;
+  - the reference vectors (`mul`, `eval`, and `tau^3 - 3 tau + 1 = 0`);
+  - `dot` and `dot_many` against sums of products, with and without accumulation;
+  - a non-Goldilocks modulus is rejected.
+- Main crate, 2 new tests on every ring: `test_slot_product_matches_slot_mul_mod` and `test_dot_products_match_sums_of_products`.
+- Main crate, 6 new tests under `cfg(rokoko_family = "trinomial")` in `ring_arithmetic::tests::trinomial`:
+  - `ring_vectors`: every vector through the naive oracle, the NTT product, the homogenized product, both conjugations, `trace_over_degree`, `subfield_generator` and `SHIFT_FACTORS`;
+  - `shift_factors_are_the_primitive_roots`;
+  - `tau_is_diagonal_after_homogenization`, with `T^3 - 3T + 1 = 0`;
+  - `conjugation_fixes_the_challenge_field`, for random `f`, and a random ring element is not fixed;
+  - `the_diagonal_is_spanned_by_powers_of_tau`;
+  - `incomplete_ntt_reduces_on_load`, through `RingElement::all(u64::MAX)` and `constant(p + 5)`.
+- Adapted tests. Their behaviour on the existing rings is unchanged.
+  - `test_constant_term_from_incomplete_ntt` became `test_trace_over_degree`.
+  - `test_norm_squared_via_conjugation` expects `sum x_i^2 + sum_{i<n} x_i x_{i+n}` for the trinomial family (the note, Corollary 3.5).
+  - `decomposition::test_random_mod_q` takes its digit count from the bit length of `q`, `ceil(bits(q) / 13)`: 4 for the 50-bit rings, as before, and 5 at `p`.
+  - `hash::rejected_words_are_replaced_in_order` runs its second half at a 50-bit modulus when `MOD_Q = p`, whose rejection bound is `p` itself.
+  - `project_fine::reduce_conjugate_matches_ntt_then_conjugate` returns early outside `LAZY_REDUCTION`: it tests a lazy-only kernel on inputs biased by `HALF_WAY_MOD_Q`, which is 0 at `p`.
+- Mutation checks: each mutation was applied, the tests run, then the code restored.
+  - `incomplete-rexl`: the first layer made negacyclic, `eta` dropped from `cubic_mul`, a term dropped from the lazy dot, a wrong inverse scale, and no reduction of inputs at or above `p`. Each makes 1 to 4 of the trinomial tests fail.
+  - Main crate at `k = 5`: a cube root not aligned on `tau`, a sign of the conjugation, the trinomial reduction of the naive product, the degree-3 adjugate, `alpha^2` in `degree3_mul`, and `SHIFT_FACTORS` taken from `Y^2`. Each makes the targeted tests fail; the `tau`-alignment mutation fails exactly the homogenization, `tau` and challenge-field tests.
+
+**Reference vectors.** `gen_vectors.py` has two new sets, `trinomial_k5` and `trinomial_k6`, 36 lines each, all in the coefficient domain:
+
+- `tau`;
+- 12 `mul`, including products that hit both reductions, `tau^2` and `tau^3`;
+- 10 `conj`, including `X^{n-1}`, `X^n`, `X^{n+1}` and `tau`;
+- 7 `trace` (`Tr/phi`);
+- 5 `eval`, giving `x mod (X^3 - eta)` for explicit `eta = theta^e`, matched to a slot by value, so independent of the slot order.
+
+The generator is still deterministic: a second run into another directory gives byte-identical files, `goldilocks_scalar.txt` included.
+
+**Results.**
+
+| Command | Result |
+|---|---|
+| `incomplete-rexl`, `cargo +nightly test --release` and debug | 9 unit + 6 Goldilocks + 27 integration + 8 trinomial pass |
+| `cargo +nightly test --lib` (debug), default ring | 184 pass, 1 fail (`challenge_stream_fingerprint`, as on `main`) |
+| `ROKOKO_RING=rings/n128_d4.toml cargo +nightly test --release --lib` | 184 pass, 1 fail (the same) |
+| `cargo +nightly test --release --no-fail-fast`, default ring | lib: 184 pass, 1 fail (`challenge_stream_fingerprint`); bin: 7 pass in 221 s; doctests: 1 fail (`builder.rs`, as on `main`); 241 s in all |
+| `cargo +nightly run --release -- p-26` | `100.3199462890625 KB` and `112.0703125 KB`; 3 interleaved runs against a `HEAD` build: prover 1.91-2.14 s (`HEAD`) and 1.94-2.10 s (branch), verifier 15.1-22.4 ms and 15.4-16.2 ms |
+| `ROKOKO_RING=rings/goldilocks_k5.toml cargo +nightly test --lib` (debug) | 179 pass, 12 fail |
+| `ROKOKO_RING=rings/goldilocks_k6.toml cargo +nightly test --lib` (debug) | 179 pass, 12 fail (the same 12) |
+
+At `k = 5` and `k = 6`, every ring-layer test passes: `common::ring_arithmetic` (32, of which 6 are trinomial-only), `common::arithmetic` (4), `common::hash` (12) and `common::decomposition` (11). `common::sumcheck_element` and `common::norms` have no unit tests of their own; they are exercised through the sumcheck and protocol tests, which pass apart from the 12 below.
+
+**Failing tests at `p`.** The same 12 fail at `k = 5` and `k = 6`:
+
+| Test | Cause | Phase |
+|---|---|---|
+| `short_challenge::tests::fft_op_norm_matches_direct_on_fixed_vector`, `samples_have_correct_weight_and_op_norm`, `parametrized_samples_have_correct_weight_and_op_norm`, `sparse_op_norm_matches_dense_fft` | the radix-2 FFT of length `DEGREE` indexes past its array (`short_challenge.rs:83`): 96 is not a power of two | 3 (Finding 7) |
+| `short_challenge::tests::challenge_stream_fingerprint` | already fails on every ring | none, pre-existing |
+| `project_fine::tests::test_batch_projection`, `test_const_term_relation_to_prove`, `exact_projection_paths_match_the_lazy_kernels` | `projection_height / DEGREE` with a height of 256 and `DEGREE = 96` truncates, and `project_coefficients` indexes past its subwitness | 4 (`n_rp = 384` and the shape checks); the projection identities also need the `conj(M j)` lift (Finding 4) |
+| `executor::tests::three_openings_round_trip`, `three_decomposition_chunks_round_trip` | the same projection-shape overrun (`project_fine.rs:552`) | 4, then 3 (challenges) and 5 (parameters) |
+| `snark::lowering::tests::test_conj_segment_ct_zero_roundtrip` | the binariness claim `sum w conj(w) - w conj(J)`, `J` the all-ones element, is expected to have a zero constant term for binary `w`, which relies on `ct(a conj b) = <cf a, cf b>`, false for this ring | 4 (SNARK layer, Finding 4) |
+| `snark::tests::test_norm_claim_roundtrip` | it expects `ct(<w, conj w>)` to be the coefficient norm; here it is `Tr/phi`, the canonical norm over `phi` | 4 (SNARK norm claims) |
+
+`common::decomposition::test_random_mod_q` is flaky on `main` already: it draws from the unseeded thread RNG (no `init_common`), and its final `inf_norm < 2^12` check fails in about 5% of runs (4 of 40 runs of an unmodified `HEAD` build; 15 of 300 runs of the branch's default-ring test binary and 23 of 300 at `k = 5`). One debug run on each ring hit it. It is not caused by this phase and is left as is.
+
+No test is ignored or `cfg`-gated to hide a failure. The only `cfg`-gated tests are the six new trinomial-only ones.
+
+**Deferred, and notes for Phase 3.**
+
+- `short_challenge.rs` still assumes `X^N + 1`: the radix-2 FFT, `PHASE_LEN = 2N` with `PHASE_MASK`, and the evaluation at odd powers of a `2N`-th root. It compiles at `p`. Finding 7 replaces it with a length-`m` phase table over the `zeta_m^j`, `gcd(j, m) = 1`.
+- `tau` and `op_norm_bound` in the Goldilocks specs are placeholders (Finding 6).
+- The fixed-weight sampler draws positions as bytes below `DEGREE`, which is fine for 96 and 192.
+
+**Notes for Phase 4.**
+
+- `trace_over_degree` call sites. None of them needs the constant term rather than `Tr/phi`:
+  - `sumchecks/runner_verifier.rs`: the three norm claims (`norm_claim`, `most_inner_norm_claim`, `projection_norm_claim`), all of the form `<w, conj w>`, where `Tr/phi` is the right functional (Corollary 3.5);
+  - `sumchecks/runner_verifier.rs`: the `Tr(r_i) = 0` check on `constant_term_claims`. Phase 4 must make sure the prover's `r_i` satisfy `Tr = 0` rather than `ct = 0`;
+  - `intermediate_sumchecks/runner_verifier.rs`: the intermediate norm claim;
+  - `parties/verifier.rs:399` and `:741`, the fine-projection constant-term consistency. It checks `Tr/phi(batched image) = sum c_1 . projection_image_ct`, which holds at `p` only with the `conj(M j)` lift (Finding 4). With today's `conj(j)` lift (`compute_j_batched_exact`) it fails.
+- Tests and SNARK code still read the constant term `.v[0]` of conjugate products directly: `project_fine.rs` tests at about lines 1114 and 1370, `snark/mod.rs` (`test_norm_claim_roundtrip`) and `snark/lowering.rs` (binariness). They rely on `ct(conj(a) b) = <cf a, cf b>`, which fails here.
+- Power-of-two shapes in the protocol: `projection_height / DEGREE`, the `DEGREE.ilog2()` layers in `project_fine.rs:1318` and `params.rs:110, 131`, and the `e_1` tensor layers.
+- `compute_j_batched_exact` lifts with `conj(j)`; Phase 4 replaces it with `conj(M j)`.
+
+**Notes for Phase 7.** `TrinomialSlotRing` is scalar. `dot_many` loops over the outputs outermost, with `5 x 128` accumulators on the stack. A NEON or AVX version can vectorise across slots: each part is contiguous and the butterflies are uniform per layer.
+
+**Unverified.** The x86 paths were neither compiled nor run: the machine has no `x86_64` standard library. The new gates are outside `#[cfg(target_arch = "x86_64")]` blocks; the only edit inside one is a doc comment on `COARSE_GROUP`. Performance at `p` was not measured.
+
+### Review fixes after Phase 2
+
+A read-only review of the Phase 2 diff found no high- or medium-severity bug.
+
+- `build.rs` stripped `_` from every spec value before matching `family`, so an explicit `family = "power_of_two"` (the documented default) failed the build. Only numeric fields are stripped now.
+- Corrected the digit-count comment in `decomposition::test_random_mod_q` and the line numbers cited above (`project_fine.rs:552`, `verifier.rs:399` and `:741`).
+- `decomposition::test_random_mod_q` is flaky on `c2fecbd` too (unseeded RNG; the reviewer saw 8 failures in 200 runs). Left as is.

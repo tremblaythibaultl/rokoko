@@ -1,0 +1,7 @@
+# Z_p[X]/(X^192 - X^96 + 1), the cyclotomic ring of conductor 9 * 2^6 = 576, over Goldilocks:
+# 64 cubic slots F_p[X]/(X^3 - eta_j). See docs/goldilocks-port.md.
+family = "trinomial"
+degree = 192
+mod_q = 18446744069414584321 # 2^64 - 2^32 + 1
+tau = 32 # provisional, uncalibrated (Phase 3): C(192,32) * 2^32 = 2^153.1 (Finding 6)
+op_norm_bound = 1000.0 # provisional, uncalibrated (Phase 3): generous, rejects nothing

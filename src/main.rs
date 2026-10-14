@@ -1,3 +1,9 @@
+#[cfg(rokoko_family = "trinomial")]
+compile_error!(
+    "no parameter sets for the trinomial (Goldilocks) rings yet: src/instantiation_goldilocks.rs \
+     is Phase 5 of docs/goldilocks-port.md; build and test the library only (`cargo test --lib`)"
+);
+
 #[cfg_attr(rokoko_ring = "n128_d4", allow(dead_code))]
 mod instantiation;
 #[cfg(rokoko_ring = "n128_d4")]

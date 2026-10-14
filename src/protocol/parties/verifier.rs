@@ -393,8 +393,10 @@ pub fn verifier_round_intermediate(
                     }
                 }
 
-                let ct = round_proof.batched_projection_image[(i, col)]
-                    .constant_term_from_incomplete_ntt();
+                // `Tr/phi` of the batched image, which is its constant term for `X^N + 1`. The
+                // identity it checks holds for the trinomial family only with the `conj(M j)`
+                // lift of the fine projection (Finding 4, Phase 4).
+                let ct = round_proof.batched_projection_image[(i, col)].trace_over_degree();
                 assert_eq!(ct, expected_ct);
             }
         }
@@ -735,8 +737,8 @@ pub fn verifier_round_simple(
             }
             let expected_ct = (expected_ct % MOD_Q as u128) as u64;
 
-            let ct =
-                round_proof.batched_projection_image[(i, k)].constant_term_from_incomplete_ntt();
+            // `Tr/phi`, the constant term for `X^N + 1`; see the intermediate check above.
+            let ct = round_proof.batched_projection_image[(i, k)].trace_over_degree();
             assert_eq!(ct, expected_ct);
         }
     }
