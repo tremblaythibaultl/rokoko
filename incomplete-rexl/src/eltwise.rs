@@ -1,8 +1,10 @@
 use crate::cpu_features::{HAS_AVX512DQ, HAS_AVX512IFMA};
 use crate::ntt::{Ifma52, Ntt};
+use crate::goldilocks;
 use crate::util::{log2, maximum_value, multiply_u64_full};
 use crate::number_theory::{
-    add_uint_mod, barrett_reduce64, multiply_mod_precon, reduce_mod, MultiplyFactor,
+    add_uint_mod, barrett_reduce64, is_wide, multiply_mod_precon, reduce_mod, sub_uint_mod,
+    MultiplyFactor,
 };
 
 #[cfg(target_arch = "x86_64")]
@@ -72,6 +74,12 @@ pub fn eltwise_add_mod(result: &mut [u64], operand1: &[u64], operand2: &[u64], m
     if n == 0 {
         return;
     }
+    if modulus == goldilocks::P {
+        return goldilocks::eltwise_add(result, operand1, operand2);
+    }
+    if is_wide(modulus) {
+        return eltwise_add_mod_wide(result, operand1, operand2, modulus);
+    }
 
     #[cfg(target_arch = "x86_64")]
     {
@@ -90,6 +98,13 @@ fn eltwise_add_mod_native(result: &mut [u64], operand1: &[u64], operand2: &[u64]
     for i in 0..result.len() {
         let sum = operand1[i] + operand2[i];
         result[i] = if sum >= modulus { sum - modulus } else { sum };
+    }
+}
+
+/// [`eltwise_add_mod_native`] for moduli whose sums can carry out of the `u64`.
+fn eltwise_add_mod_wide(result: &mut [u64], operand1: &[u64], operand2: &[u64], modulus: u64) {
+    for ((r, &a), &b) in result.iter_mut().zip(operand1).zip(operand2) {
+        *r = add_uint_mod(a, b, modulus);
     }
 }
 
@@ -135,6 +150,12 @@ unsafe fn eltwise_add_mod_avx512(
 /// `result = result + operand mod modulus` for inputs below `modulus`.
 pub(crate) fn eltwise_add_mod_assign(result: &mut [u64], operand: &[u64], modulus: u64) {
     assert!(operand.len() >= result.len());
+    if is_wide(modulus) {
+        for (x, &y) in result.iter_mut().zip(operand) {
+            *x = add_uint_mod(*x, y, modulus);
+        }
+        return;
+    }
     #[cfg(target_arch = "x86_64")]
     if *HAS_AVX512DQ && result.len() % 8 == 0 {
         unsafe { eltwise_add_mod_assign_avx512(result, operand, modulus) };
@@ -164,6 +185,15 @@ pub fn eltwise_sub_mod(result: &mut [u64], operand1: &[u64], operand2: &[u64], m
     if n == 0 {
         return;
     }
+    if modulus == goldilocks::P {
+        return goldilocks::eltwise_sub(result, operand1, operand2);
+    }
+    if is_wide(modulus) {
+        for ((r, &a), &b) in result.iter_mut().zip(operand1).zip(operand2) {
+            *r = sub_uint_mod(a, b, modulus);
+        }
+        return;
+    }
 
     #[cfg(target_arch = "x86_64")]
     {
@@ -183,7 +213,8 @@ fn eltwise_sub_mod_native(result: &mut [u64], operand1: &[u64], operand2: &[u64]
         if operand1[i] >= operand2[i] {
             result[i] = operand1[i] - operand2[i];
         } else {
-            result[i] = operand1[i] + modulus - operand2[i];
+            // Below `modulus`, so the wrapping sum is exact for any `modulus < 2^64`.
+            result[i] = operand1[i].wrapping_add(modulus).wrapping_sub(operand2[i]);
         }
     }
 }
@@ -240,6 +271,13 @@ pub fn eltwise_reduce_mod(result: &mut [u64], operand: &[u64], modulus: u64) {
         result.copy_from_slice(operand);
         return;
     }
+    if modulus == goldilocks::P {
+        return goldilocks::eltwise_reduce(result, operand);
+    }
+    if is_wide(modulus) {
+        // Barrett with `floor(2^64 / q)` leaves `[0, 2q)`, whatever the width of `q`.
+        return eltwise_reduce_mod_native(result, operand, modulus, input_mod_factor, 1);
+    }
 
     #[cfg(target_arch = "x86_64")]
     {
@@ -292,8 +330,9 @@ fn eltwise_reduce_mod_native(
     debug_assert!(output_mod_factor == 1 || output_mod_factor == 2);
     debug_assert!(input_mod_factor != output_mod_factor);
 
+    debug_assert!(output_mod_factor == 1 || !is_wide(modulus));
     let barrett_factor = MultiplyFactor::new(1, 64, modulus).barrett_factor();
-    let twice_modulus = modulus << 1;
+    let twice_modulus = modulus.wrapping_shl(1);
 
     if input_mod_factor == modulus {
         if output_mod_factor == 2 {
@@ -494,6 +533,15 @@ pub fn eltwise_mult_mod(result: &mut [u64], operand1: &[u64], operand2: &[u64], 
     if n == 0 {
         return;
     }
+    if modulus == goldilocks::P {
+        return goldilocks::eltwise_mult(result, operand1, operand2);
+    }
+    if is_wide(modulus) {
+        for ((r, &a), &b) in result.iter_mut().zip(operand1).zip(operand2) {
+            *r = ((a as u128 * b as u128) % modulus as u128) as u64;
+        }
+        return;
+    }
     let input_mod_factor = 1u64;
 
     #[cfg(target_arch = "x86_64")]
@@ -545,7 +593,7 @@ fn eltwise_mult_mod_native<const INPUT_MOD_FACTOR: u64>(
     modulus: u64,
 ) {
     debug_assert!(INPUT_MOD_FACTOR == 1 || INPUT_MOD_FACTOR == 2 || INPUT_MOD_FACTOR == 4);
-    debug_assert!(modulus < (1u64 << 62));
+    debug_assert!(!is_wide(modulus));
 
     let beta = -2i64;
     let alpha = 62i64;
@@ -1129,6 +1177,10 @@ fn eltwise_fma_mod_internal(
             || input_mod_factor == 4
             || input_mod_factor == 8
     );
+    if modulus == goldilocks::P || is_wide(modulus) {
+        debug_assert!(input_mod_factor == 1);
+        return eltwise_fma_mod_wide(result, arg1, arg2, arg3, modulus);
+    }
 
     #[cfg(target_arch = "x86_64")]
     {
@@ -1168,6 +1220,34 @@ fn eltwise_fma_mod_internal(
     }
 }
 
+/// `eltwise_fma_mod_native::<1>` for wide moduli: Shoup's product needs `modulus < 2^63`, and
+/// `4 modulus` leaves the `u64`.
+fn eltwise_fma_mod_wide(
+    result: &mut [u64],
+    arg1: &[u64],
+    arg2: u64,
+    arg3: Option<&[u64]>,
+    modulus: u64,
+) {
+    if modulus == goldilocks::P {
+        return goldilocks::eltwise_fma(result, arg1, arg2, arg3);
+    }
+    let arg2 = arg2 % modulus;
+    let product = |a: u64| ((a as u128 * arg2 as u128) % modulus as u128) as u64;
+    match arg3 {
+        Some(arg3) => {
+            for ((r, &a), &c) in result.iter_mut().zip(arg1).zip(arg3) {
+                *r = add_uint_mod(product(a), c, modulus);
+            }
+        }
+        None => {
+            for (r, &a) in result.iter_mut().zip(arg1) {
+                *r = product(a);
+            }
+        }
+    }
+}
+
 fn eltwise_fma_mod_native<const INPUT_MOD_FACTOR: u64>(
     result: &mut [u64],
     arg1: &[u64],
@@ -1175,6 +1255,7 @@ fn eltwise_fma_mod_native<const INPUT_MOD_FACTOR: u64>(
     arg3: Option<&[u64]>,
     modulus: u64,
 ) {
+    debug_assert!(!is_wide(modulus));
     let twice_modulus = 2 * modulus;
     let four_times_modulus = 4 * modulus;
     let arg2 = reduce_mod::<INPUT_MOD_FACTOR>(

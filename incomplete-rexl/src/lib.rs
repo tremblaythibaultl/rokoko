@@ -7,16 +7,20 @@ mod aligned_vec;
 mod avx512_util;
 pub mod cpu_features;
 mod eltwise;
+pub mod goldilocks;
 mod ntt;
 mod ntt_avx512_util;
 mod number_theory;
+pub mod trinomial;
 mod util;
 
 pub use eltwise::{
     eltwise_add_mod, eltwise_fma_mod, eltwise_mult_mod, eltwise_reduce_mod, eltwise_sub_mod,
     fused_incomplete_ntt_mult_inner,
 };
+pub use goldilocks::P as GOLDILOCKS_P;
 pub use number_theory::{add_uint_mod, inverse_mod, multiply_mod, pow_mod, sub_uint_mod};
+pub use trinomial::TrinomialSlotRing;
 
 pub fn power_mod(a: u64, b: u64, modulus: u64) -> u64 {
     pow_mod(a, b, modulus)
@@ -387,7 +391,9 @@ unsafe fn slot_mult(
     }
 }
 
-/// [`fused_slot_mult`] for one `(N, q)`, with the tables and kernel looked up once.
+/// [`fused_slot_mult`] for one `(N, q)`, with the tables and kernel looked up once: the slots of
+/// the power-of-two family `Z_q[X]/(X^N + 1)`. [`TrinomialSlotRing`] is the same interface for
+/// `Z_p[X]/(X^{2n} - X^n + 1)` over Goldilocks; the caller picks the family.
 pub struct SlotRing {
     ntt: Arc<ntt::Ntt>,
     ring_degree: usize,
@@ -397,6 +403,7 @@ pub struct SlotRing {
 }
 
 impl SlotRing {
+    /// The slots of `Z_q[X]/(X^N + 1)`, `N = ring_degree`, `q = modulus`.
     pub fn new(ring_degree: usize, modulus: u64) -> Self {
         let slot_degree = supported_slot_degree(ring_degree, modulus);
         let n = ring_degree / slot_degree;
